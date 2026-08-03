@@ -8,7 +8,8 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, RowHitbox, Tab},
+    app::{App, ConfigFocus, RowHitbox, Tab},
+    config::MIN_REFRESH_SECONDS,
     model::{
         CheckState, DisplayReviewState, MergeableState, PullRequest, ReviewState, ReviewerKind,
     },
@@ -36,14 +37,17 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_footer(frame, chunks[3], app);
 
     if app.show_help {
-        render_help(frame, area);
+        render_help(frame, area, app);
+    }
+    if app.config_editor.is_some() {
+        render_config(frame, area, app);
     }
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = Line::from(vec![
         Span::styled(
-            " REVIEW MONITOR ",
+            " KRITIKON ",
             Style::default()
                 .fg(Color::Black)
                 .bg(ACCENT)
@@ -54,16 +58,20 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.data
                 .as_ref()
                 .map(|data| format!("@{}", data.viewer))
-                .unwrap_or_else(|| "GitHub pull requests".into()),
+                .unwrap_or_else(|| "GitHub review command center".into()),
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ]);
 
     let subtitle = if let Some(data) = &app.data {
-        let team_scope = if app.include_team_requests {
-            format!("{} teams checked", data.team_count)
+        let refresh = if app.loading {
+            "refreshing…".into()
         } else {
-            "direct requests only".into()
+            let seconds = app
+                .refresh_remaining
+                .as_secs()
+                .saturating_add(u64::from(app.refresh_remaining.subsec_nanos() > 0));
+            format!("next in {seconds}s")
         };
         Line::from(vec![
             Span::styled(" Open PRs only", Style::default().fg(ACCENT)),
@@ -73,7 +81,24 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(MUTED),
             ),
             Span::styled("  ·  ", Style::default().fg(MUTED)),
-            Span::styled(team_scope, Style::default().fg(MUTED)),
+            Span::styled(
+                format!("every {}s · {refresh}", app.config.refresh_seconds),
+                Style::default().fg(MUTED),
+            ),
+            if app.commit_loading {
+                Span::styled("  ·  indexing commits…", Style::default().fg(Color::Yellow))
+            } else {
+                Span::raw("")
+            },
+            app.data_source
+                .label()
+                .map(|scenario| {
+                    Span::styled(
+                        format!("  ·  DEV {scenario}"),
+                        Style::default().fg(Color::Yellow),
+                    )
+                })
+                .unwrap_or_else(|| Span::raw("")),
             if data.warnings.is_empty() {
                 Span::raw("")
             } else {
@@ -101,22 +126,33 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let tabs = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(area);
-    app.tab_hitboxes = [tabs[0], tabs[1]];
+    app.tab_hitboxes = [tabs[0], tabs[1], tabs[2]];
 
-    let requested_count = app.data.as_ref().map_or(0, |data| data.requested.len());
+    let review_count = app.data.as_ref().map_or(0, |data| data.review_queue.len());
+    let involved_count = app.data.as_ref().map_or(0, |data| data.involved.len());
     let owned_count = app.data.as_ref().map_or(0, |data| data.owned.len());
     render_tab(
         frame,
         tabs[0],
-        format!("1  REVIEW REQUESTED   {requested_count}"),
-        app.tab == Tab::Requested,
+        format!("TO REVIEW   {review_count}"),
+        app.tab == Tab::ReviewQueue,
     );
     render_tab(
         frame,
         tabs[1],
-        format!("2  MY OPEN PRS   {owned_count}"),
+        format!("INVOLVED   {involved_count}"),
+        app.tab == Tab::Involved,
+    );
+    render_tab(
+        frame,
+        tabs[2],
+        format!("MY PRS   {owned_count}"),
         app.tab == Tab::Owned,
     );
 }
@@ -181,7 +217,8 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let title = match app.tab {
-        Tab::Requested => " Review requested — direct + team ",
+        Tab::ReviewQueue => " Needs your review — direct + every team ",
+        Tab::Involved => " Open PRs you have taken part in ",
         Tab::Owned => " Your open pull requests ",
     };
     let block = Block::default()
@@ -209,12 +246,14 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     };
 
     let items = match app.tab {
-        Tab::Requested => &data.requested,
+        Tab::ReviewQueue => &data.review_queue,
+        Tab::Involved => &data.involved,
         Tab::Owned => &data.owned,
     };
     if items.is_empty() {
         let message = match app.tab {
-            Tab::Requested => "No open PRs are waiting for your review.",
+            Tab::ReviewQueue => "No open PRs are waiting for your review.",
+            Tab::Involved => "No other open PRs currently show your participation.",
             Tab::Owned => "You have no open pull requests.",
         };
         frame.render_widget(
@@ -290,7 +329,7 @@ fn render_row(
     ));
 
     let metadata = match tab {
-        Tab::Requested => {
+        Tab::ReviewQueue => {
             let via = if pull_request.requested_via.is_empty() {
                 "request pending".into()
             } else {
@@ -307,6 +346,20 @@ fn render_row(
                 via,
                 prior,
                 pull_request.total_review_events
+            )
+        }
+        Tab::Involved => {
+            let reasons = if pull_request.involvement.is_empty() {
+                "PARTICIPATING".into()
+            } else {
+                pull_request.involvement_label()
+            };
+            let checks = pull_request.checks.map_or("No checks", CheckState::label);
+            format!(
+                "  {reasons} · @{} · updated {} · CI {}",
+                pull_request.author,
+                relative_time(pull_request.updated_at),
+                checks
             )
         }
         Tab::Owned => {
@@ -352,7 +405,8 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &mut App, compact: boo
         return;
     };
     let item = match app.tab {
-        Tab::Requested => data.requested.get(app.selected_index()),
+        Tab::ReviewQueue => data.review_queue.get(app.selected_index()),
+        Tab::Involved => data.involved.get(app.selected_index()),
         Tab::Owned => data.owned.get(app.selected_index()),
     };
     let Some(pr) = item else {
@@ -390,7 +444,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &mut App, compact: boo
         )),
     ];
 
-    if app.tab == Tab::Requested {
+    if app.tab == Tab::ReviewQueue {
         let via = if pr.requested_via.is_empty() {
             "Unknown request source".into()
         } else {
@@ -406,6 +460,21 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &mut App, compact: boo
                 pr.viewer_review(&data.viewer)
                     .map(|review| format!("Last review: {}", review.state.label()))
                     .unwrap_or_else(|| "No submitted review yet".into()),
+            ),
+        ]));
+    }
+
+    if app.tab == Tab::Involved {
+        let reasons = if pr.involvement.is_empty() {
+            "PARTICIPATING".into()
+        } else {
+            pr.involvement_label()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Why here ", Style::default().fg(MUTED)),
+            Span::styled(
+                reasons,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -569,7 +638,7 @@ fn render_compact_details(
             .join(", ")
     };
     let context = match tab {
-        Tab::Requested => {
+        Tab::ReviewQueue => {
             let via = if pr.requested_via.is_empty() {
                 "unknown".into()
             } else {
@@ -581,6 +650,14 @@ fn render_compact_details(
                 .unwrap_or("NO REVIEW YET");
             format!("Request  {via} · You: {your_state}")
         }
+        Tab::Involved => format!(
+            "Why here  {}",
+            if pr.involvement.is_empty() {
+                "PARTICIPATING".into()
+            } else {
+                pr.involvement_label()
+            }
+        ),
         Tab::Owned => format!("Waiting  {waiting}"),
     };
 
@@ -642,6 +719,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(notice.clone(), Style::default().fg(ACCENT))
     } else if app.loading && app.data.is_some() {
         Span::styled("Refreshing…", Style::default().fg(Color::Yellow))
+    } else if app.commit_loading && app.data.is_some() {
+        Span::styled(
+            "Discovering open PRs connected to your commits…",
+            Style::default().fg(Color::Yellow),
+        )
     } else if let Some(error) = &app.error {
         Span::styled(
             format!("Refresh failed: {error}"),
@@ -657,11 +739,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let keys = if app.details_expanded {
-        "↑↓/jk/PgUp/PgDn scroll details  Home/End jump  Enter open  d/Esc return  ? help  q quit"
+        "↑↓/jk/PgUp/PgDn scroll details  Home/End jump  Enter open  c copy branch  d/Esc return  t timer  ? help  q quit"
     } else if area.width >= 100 {
-        "↑↓/jk move  PgUp/PgDn  1/2/Tab switch  Enter/o open  d details  r refresh  ? help  q quit  ·  mouse: wheel + click to open"
+        "↑↓/jk move  PgUp/PgDn  Tab/←→ views  Enter/o open  c copy branch  d details  t timer  r refresh  ? help  q quit"
     } else {
-        "↑↓ move  1/2 switch  Enter open  d details  r refresh  ? help  q quit"
+        "↑↓ move  Tab/←→ views  Enter open  c copy  d details  t timer  r refresh  ? help  q quit"
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -704,9 +786,9 @@ fn render_startup_error(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn render_help(frame: &mut Frame<'_>, area: Rect) {
+fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let width = 82.min(area.width.saturating_sub(2));
-    let height = 25.min(area.height.saturating_sub(2));
+    let height = 31.min(area.height.saturating_sub(2));
     let popup = centered_rect(width, height, area);
     frame.render_widget(Clear, popup);
     let help = vec![
@@ -715,9 +797,24 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::raw("  ↑/↓ or j/k  move     PgUp/PgDn  page     Home/End  jump"),
-        Line::raw("  1/2 or Tab   switch views     Enter/o  open in browser"),
-        Line::raw("  d  expand details (then arrows/wheel scroll)     r  refresh     q  quit"),
+        Line::raw("  Tab/Shift+Tab or ←/→  switch views     Enter/o  open in browser"),
+        Line::raw("  c  copy head branch     d  expand details     t  refresh timer"),
+        Line::raw("  r  refresh     q  quit"),
         Line::raw("  Mouse wheel scrolls; a single left-click on a PR opens it."),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Command-center views",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw("  TO REVIEW  outstanding requests to you or any team you belong to"),
+        Line::raw(
+            "  INVOLVED   PRs you committed to, reviewed, commented on, were assigned or mentioned in",
+        ),
+        Line::raw("  MY PRS     every open PR you authored, including drafts and no-review PRs"),
+        review_sources_line(app),
+        Line::raw(
+            "  Commit-only discovery indexes your 1,000 newest searchable commits in the background.",
+        ),
         Line::raw(""),
         Line::from(Span::styled(
             "Every review state",
@@ -760,13 +857,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ),
         Line::raw(""),
         Line::from(Span::styled(
-            "Other states and scope",
+            "Other states and sources",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::raw("  DRAFT / READY · Mergeable / Conflicts / Calculating"),
         Line::raw("  Checks: Passing / Failing / Error / Pending / Expected / No checks"),
         Line::raw("  Only open PRs are queried. Drafts and PRs with no reviews are included."),
-        Line::raw("  Review requests include you directly and every visible team you belong to."),
     ];
     frame.render_widget(
         Paragraph::new(help).wrap(Wrap { trim: true }).block(
@@ -778,6 +874,180 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ),
         popup,
     );
+}
+
+fn review_sources_line(app: &App) -> Line<'static> {
+    let Some(data) = &app.data else {
+        return Line::raw("  Review requests always include you directly and all visible teams.");
+    };
+    let sources = if data.teams.is_empty() {
+        format!("@{} directly; no visible teams were returned", data.viewer)
+    } else {
+        format!("@{} directly + {}", data.viewer, data.teams.join(", "))
+    };
+    Line::from(vec![
+        Span::styled("  Monitoring: ", Style::default().fg(MUTED)),
+        Span::raw(sources),
+    ])
+}
+
+fn render_config(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(editor) = app.config_editor.clone() else {
+        return;
+    };
+    let width = 82.min(area.width.saturating_sub(2));
+    let height = 17.min(area.height.saturating_sub(2));
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Configuration ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(popup).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    frame.render_widget(block, popup);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("File  ", Style::default().fg(MUTED)),
+            Span::raw(app.config_path.display().to_string()),
+        ])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    frame.render_widget(
+        Paragraph::new("Refresh interval (seconds)")
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Rect::new(inner.x, inner.y + 2, inner.width, 1),
+    );
+    let refresh_rect = Rect::new(inner.x, inner.y + 3, 26.min(inner.width), 3);
+    app.config_hitboxes.refresh = refresh_rect;
+    let input_style = focus_style(editor.focus == ConfigFocus::Refresh);
+    let cursor = if editor.focus == ConfigFocus::Refresh {
+        "▌"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{}{}", editor.refresh_input, cursor))
+            .style(input_style)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(input_style),
+            ),
+        refresh_rect,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Whole seconds only · minimum {MIN_REFRESH_SECONDS} · no configured maximum"
+        ))
+        .style(Style::default().fg(MUTED)),
+        Rect::new(inner.x, inner.y + 6, inner.width, 1),
+    );
+
+    let message = if editor.confirm_reset {
+        Line::from(Span::styled(
+            "Delete the config file and restore the 30-second timer? Press y, x, or Enter to confirm; Esc cancels.",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if let Some(error) = &editor.error {
+        Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red)))
+    } else {
+        Line::from(Span::styled(
+            "This only controls refresh timing. Direct and all visible team requests are always included.",
+            Style::default().fg(MUTED),
+        ))
+    };
+    frame.render_widget(
+        Paragraph::new(message).wrap(Wrap { trim: true }),
+        Rect::new(inner.x, inner.y + 8, inner.width, 2),
+    );
+
+    let button_area = Rect::new(inner.x, inner.y + 10, inner.width, 3);
+    let buttons = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+        ])
+        .split(button_area);
+    app.config_hitboxes.save = buttons[0];
+    app.config_hitboxes.reset = buttons[1];
+    app.config_hitboxes.cancel = buttons[2];
+    render_config_button(
+        frame,
+        buttons[0],
+        "Save",
+        editor.focus == ConfigFocus::Save,
+        Color::Green,
+    );
+    render_config_button(
+        frame,
+        buttons[1],
+        "Reset & delete",
+        editor.focus == ConfigFocus::Reset,
+        Color::Yellow,
+    );
+    render_config_button(
+        frame,
+        buttons[2],
+        "Cancel",
+        editor.focus == ConfigFocus::Cancel,
+        MUTED,
+    );
+    frame.render_widget(
+        Paragraph::new("Tab/↑↓ controls · type seconds · Enter/s save · x reset · Esc cancel")
+            .style(Style::default().fg(MUTED)),
+        Rect::new(inner.x, inner.y + 13, inner.width, 1),
+    );
+}
+
+fn render_config_button(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    label: &str,
+    focused: bool,
+    color: Color,
+) {
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Center)
+            .style(if focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(if focused {
+                        Style::default().fg(color)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    }),
+            ),
+        area,
+    );
+}
+
+fn focus_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    }
 }
 
 fn legend<'a>(label: &'a str, description: &'a str, color: Color) -> Line<'a> {
@@ -866,8 +1136,8 @@ mod tests {
     use crate::{
         app::App,
         model::{
-            DashboardData, MergeableState, PullRequest, Review, ReviewDecision, ReviewRequest,
-            ReviewState, ReviewerKind,
+            DashboardData, InvolvementReason, MergeableState, PullRequest, Review, ReviewDecision,
+            ReviewRequest, ReviewState, ReviewerKind,
         },
     };
 
@@ -905,6 +1175,7 @@ mod tests {
             labels: vec!["ui".into()],
             checks: Some(CheckState::Failure),
             requested_via: vec!["@viewer".into()],
+            involvement: vec![InvolvementReason::Committed, InvolvementReason::Commented],
         }
     }
 
@@ -913,11 +1184,12 @@ mod tests {
         let pr = sample_pr();
         let data = DashboardData {
             viewer: "viewer".into(),
-            requested: vec![pr.clone()],
+            review_queue: vec![pr.clone()],
+            involved: vec![pr.clone()],
             owned: vec![pr],
             warnings: vec![],
             fetched_at: Utc::now(),
-            team_count: 2,
+            teams: vec!["acme/core".into(), "acme/platform".into()],
         };
         let mut app = App::with_data(data);
         let backend = TestBackend::new(140, 34);
@@ -933,8 +1205,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("REVIEW REQUESTED"));
-        assert!(rendered.contains("MY OPEN PRS"));
+        assert!(rendered.contains("KRITIKON"));
+        assert!(rendered.contains("TO REVIEW"));
+        assert!(rendered.contains("INVOLVED"));
+        assert!(rendered.contains("MY PRS"));
         assert!(rendered.contains("CHANGES REQUESTED"));
         assert!(rendered.contains("review-dashboard"));
         assert!(rendered.contains("Reviewer breakdown"));
@@ -945,11 +1219,12 @@ mod tests {
         let pr = sample_pr();
         let data = DashboardData {
             viewer: "viewer".into(),
-            requested: vec![pr],
+            review_queue: vec![pr],
+            involved: vec![],
             owned: vec![],
             warnings: vec![],
             fetched_at: Utc::now(),
-            team_count: 1,
+            teams: vec!["acme/core".into()],
         };
         let mut app = App::with_data(data);
         let backend = TestBackend::new(80, 24);
@@ -968,5 +1243,103 @@ mod tests {
         assert!(rendered.contains("Review   CHANGES REQUESTED"));
         assert!(rendered.contains("Request  @viewer"));
         assert!(rendered.contains("Status   Conflicts"));
+    }
+
+    #[test]
+    fn configuration_editor_is_clear_and_mouse_targets_are_registered() {
+        let pr = sample_pr();
+        let data = DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![pr],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec!["acme/core".into()],
+        };
+        let mut app = App::with_data(data);
+        app.open_config(None);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Refresh interval (seconds)"));
+        assert!(rendered.contains("minimum 5"));
+        assert!(rendered.contains("only controls refresh timing"));
+        assert!(!rendered.contains("Direct only"));
+        assert!(!rendered.contains("Teams only"));
+        assert!(rendered.contains("Reset & delete"));
+        assert!(app.config_hitboxes.save.width > 0);
+    }
+
+    #[test]
+    fn involved_view_explains_why_each_pr_is_present() {
+        let pr = sample_pr();
+        let data = DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![],
+            involved: vec![pr],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec!["acme/core".into()],
+        };
+        let mut app = App::with_data(data);
+        app.set_tab(Tab::Involved);
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("COMMITTED + COMMENTED"));
+        assert!(rendered.contains("Why here"));
+    }
+
+    #[test]
+    fn help_names_every_monitored_team() {
+        let data = DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec!["acme/core".into(), "acme/platform".into()],
+        };
+        let mut app = App::with_data(data);
+        app.show_help = true;
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("@viewer directly"));
+        assert!(rendered.contains("acme/core"));
+        assert!(rendered.contains("acme/platform"));
     }
 }

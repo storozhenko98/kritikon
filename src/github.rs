@@ -2,6 +2,8 @@ use std::{
     collections::{HashMap, HashSet},
     io::Write,
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,20 +11,38 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    CheckState, DashboardData, MergeableState, PullRequest, Review, ReviewDecision, ReviewRequest,
-    ReviewState, ReviewerKind,
+    CheckState, DashboardData, InvolvementReason, MergeableState, PullRequest, Review,
+    ReviewDecision, ReviewRequest, ReviewState, ReviewerKind,
 };
 
 const PAGE_SIZE: u32 = 50;
 const GITHUB_SEARCH_LIMIT: usize = 1_000;
+const COMMIT_DISCOVERY_TTL: Duration = Duration::from_secs(300);
 
 const SEARCH_QUERY: &str = r#"
-query ReviewMonitorSearch($query: String!, $cursor: String, $pageSize: Int!) {
+query KritikonSearch($query: String!, $cursor: String, $pageSize: Int!) {
   search(query: $query, type: ISSUE, first: $pageSize, after: $cursor) {
     issueCount
     pageInfo { hasNextPage endCursor }
     nodes {
-      ... on PullRequest {
+      ...PullRequestFields
+    }
+  }
+}
+"#;
+
+const NODE_QUERY: &str = r#"
+query KritikonNodes($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ...PullRequestFields
+  }
+}
+"#;
+
+const PULL_REQUEST_FRAGMENT: &str = r#"
+fragment PullRequestFields on PullRequest {
+        id
+        state
         number
         title
         url
@@ -38,7 +58,8 @@ query ReviewMonitorSearch($query: String!, $cursor: String, $pageSize: Int!) {
         reviewDecision
         author { login }
         repository { nameWithOwner }
-        comments { totalCount }
+        comments(last: 100) { totalCount nodes { author { login } } }
+        assignees(first: 100) { nodes { login } }
         labels(first: 10) { nodes { name } }
         reviews(last: 100) {
           totalCount
@@ -58,64 +79,153 @@ query ReviewMonitorSearch($query: String!, $cursor: String, $pageSize: Int!) {
             }
           }
         }
-        commits(last: 1) {
-          nodes { commit { statusCheckRollup { state } } }
+        commits(last: 100) {
+          nodes {
+            commit {
+              authors(first: 10) { nodes { user { login } } }
+              statusCheckRollup { state }
+            }
+          }
         }
+}
+"#;
+
+const ASSOCIATED_PULL_REQUESTS_QUERY: &str = r#"
+query KritikonCommitAssociations($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Commit {
+      associatedPullRequests(first: 10) {
+        nodes { id state }
       }
     }
   }
 }
 "#;
 
-pub fn fetch_dashboard(include_team_requests: bool) -> Result<DashboardData> {
+pub fn fetch_dashboard() -> Result<DashboardData> {
     let viewer = fetch_viewer()?;
     let mut warnings = Vec::new();
 
     let owned_query = format!("is:pr is:open author:{viewer} sort:updated-desc");
-    let mut owned = fetch_search(&owned_query, None, &mut warnings)
-        .context("could not load your open pull requests")?;
+    let mut owned = fetch_search(
+        &owned_query,
+        None,
+        InvolvementDiscovery::None,
+        &mut warnings,
+    )
+    .context("could not load your open pull requests")?;
 
     let direct_query = format!("is:pr is:open user-review-requested:{viewer} sort:updated-desc");
-    let mut requested = fetch_search(&direct_query, Some(format!("@{viewer}")), &mut warnings)
-        .context("could not load direct review requests")?;
+    let mut review_queue = fetch_search(
+        &direct_query,
+        Some(format!("@{viewer}")),
+        InvolvementDiscovery::None,
+        &mut warnings,
+    )
+    .context("could not load direct review requests")?;
 
-    let teams = if include_team_requests {
-        match fetch_teams() {
-            Ok(teams) => teams,
-            Err(error) => {
-                warnings.push(format!(
-                    "Team review requests unavailable; direct requests are still shown ({error:#})"
-                ));
-                Vec::new()
-            }
+    let teams = match fetch_teams() {
+        Ok(teams) => teams,
+        Err(error) => {
+            warnings.push(format!("Team review requests unavailable ({error:#})"));
+            Vec::new()
         }
-    } else {
-        Vec::new()
     };
 
     for team in &teams {
         let team_name = format!("{}/{}", team.organization.login, team.slug);
         let query = format!("is:pr is:open team-review-requested:{team_name} sort:updated-desc");
-        match fetch_search(&query, Some(team_name.clone()), &mut warnings) {
-            Ok(team_prs) => requested.extend(team_prs),
+        match fetch_search(
+            &query,
+            Some(team_name.clone()),
+            InvolvementDiscovery::None,
+            &mut warnings,
+        ) {
+            Ok(team_prs) => review_queue.extend(team_prs),
             Err(error) => warnings.push(format!(
                 "Could not load requests for {team_name} ({error:#})"
             )),
         }
     }
 
-    deduplicate_requested(&mut requested);
+    deduplicate_pull_requests(&mut review_queue);
+
+    let involves_query =
+        format!("is:pr is:open involves:{viewer} -author:{viewer} sort:updated-desc");
+    let mut involved = fetch_search(
+        &involves_query,
+        None,
+        InvolvementDiscovery::Involves(&viewer),
+        &mut warnings,
+    )
+    .context("could not load open pull requests you participate in")?;
+
+    let reviewed_query =
+        format!("is:pr is:open reviewed-by:{viewer} -author:{viewer} sort:updated-desc");
+    let reviewed = fetch_search(
+        &reviewed_query,
+        None,
+        InvolvementDiscovery::Reason(InvolvementReason::Reviewed),
+        &mut warnings,
+    )
+    .context("could not load open pull requests you reviewed")?;
+    involved.extend(reviewed);
+
+    involved.retain(|pull_request| !pull_request.author.eq_ignore_ascii_case(&viewer));
+    deduplicate_pull_requests(&mut involved);
     owned.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    requested.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    review_queue.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    involved.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut team_names = teams
+        .iter()
+        .map(|team| format!("{}/{}", team.organization.login, team.slug))
+        .collect::<Vec<_>>();
+    team_names.sort();
 
     Ok(DashboardData {
         viewer,
-        requested,
+        review_queue,
+        involved,
         owned,
         warnings,
         fetched_at: Utc::now(),
-        team_count: teams.len(),
+        teams: team_names,
     })
+}
+
+#[derive(Debug)]
+pub struct CommitInvolvement {
+    pub pull_requests: Vec<PullRequest>,
+}
+
+pub fn fetch_commit_involvement(viewer: &str) -> Result<CommitInvolvement> {
+    let discovery = discover_committed_pull_request_ids(viewer)?;
+    let mut pull_requests = fetch_pull_requests_by_ids(&discovery.pull_request_ids)?;
+    pull_requests.retain(|pull_request| !pull_request.author.eq_ignore_ascii_case(viewer));
+    for pull_request in &mut pull_requests {
+        pull_request.add_involvement(InvolvementReason::Committed);
+    }
+    deduplicate_pull_requests(&mut pull_requests);
+    pull_requests.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(CommitInvolvement { pull_requests })
+}
+
+pub fn fetch_complete_dashboard() -> Result<DashboardData> {
+    let mut dashboard = fetch_dashboard()?;
+    match fetch_commit_involvement(&dashboard.viewer) {
+        Ok(commit_involvement) => {
+            dashboard.involved.extend(commit_involvement.pull_requests);
+            deduplicate_pull_requests(&mut dashboard.involved);
+            dashboard
+                .involved
+                .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        }
+        Err(error) => dashboard.warnings.push(format!(
+            "Commit-based involvement is temporarily unavailable ({error:#})"
+        )),
+    }
+    Ok(dashboard)
 }
 
 fn fetch_viewer() -> Result<String> {
@@ -136,9 +246,67 @@ fn fetch_teams() -> Result<Vec<ApiTeam>> {
     Ok(pages.into_iter().flatten().collect())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InvolvementDiscovery<'a> {
+    None,
+    Involves(&'a str),
+    Reason(InvolvementReason),
+}
+
+impl InvolvementDiscovery<'_> {
+    fn reasons(self, pull_request: &ApiPullRequest) -> Vec<InvolvementReason> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Reason(reason) => vec![reason],
+            Self::Involves(viewer) => {
+                let mut reasons = Vec::new();
+                if pull_request
+                    .assignees
+                    .nodes
+                    .iter()
+                    .any(|actor| actor.login.eq_ignore_ascii_case(viewer))
+                {
+                    reasons.push(InvolvementReason::Assigned);
+                }
+                if pull_request.comments.nodes.iter().any(|comment| {
+                    comment
+                        .author
+                        .as_ref()
+                        .is_some_and(|actor| actor.login.eq_ignore_ascii_case(viewer))
+                }) {
+                    reasons.push(InvolvementReason::Commented);
+                }
+                if pull_request.reviews.nodes.iter().any(|review| {
+                    review
+                        .author
+                        .as_ref()
+                        .is_some_and(|actor| actor.login.eq_ignore_ascii_case(viewer))
+                }) {
+                    reasons.push(InvolvementReason::Reviewed);
+                }
+                if pull_request.commits.nodes.iter().any(|node| {
+                    node.commit.authors.nodes.iter().any(|author| {
+                        author
+                            .user
+                            .as_ref()
+                            .is_some_and(|actor| actor.login.eq_ignore_ascii_case(viewer))
+                    })
+                }) {
+                    reasons.push(InvolvementReason::Committed);
+                }
+                if reasons.is_empty() {
+                    reasons.push(InvolvementReason::Mentioned);
+                }
+                reasons
+            }
+        }
+    }
+}
+
 fn fetch_search(
     search: &str,
     requested_via: Option<String>,
+    involvement_discovery: InvolvementDiscovery<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PullRequest>> {
     let mut cursor: Option<String> = None;
@@ -146,8 +314,9 @@ fn fetch_search(
     let mut warned_about_limit = false;
 
     loop {
-        let payload = GraphQlRequest {
-            query: SEARCH_QUERY,
+        let query = format!("{SEARCH_QUERY}\n{PULL_REQUEST_FRAGMENT}");
+        let payload = SearchGraphQlRequest {
+            query: &query,
             variables: SearchVariables {
                 query: search,
                 cursor: cursor.as_deref(),
@@ -183,9 +352,13 @@ fn fetch_search(
         }
 
         for node in connection.nodes {
+            let reasons = involvement_discovery.reasons(&node);
             let mut pull_request = PullRequest::from(node);
             if let Some(via) = &requested_via {
                 pull_request.requested_via.push(via.clone());
+            }
+            for reason in reasons {
+                pull_request.add_involvement(reason);
             }
             pull_requests.push(pull_request);
         }
@@ -202,11 +375,16 @@ fn fetch_search(
     Ok(pull_requests)
 }
 
-fn deduplicate_requested(pull_requests: &mut Vec<PullRequest>) {
+fn deduplicate_pull_requests(pull_requests: &mut Vec<PullRequest>) {
     let mut by_url: HashMap<String, PullRequest> = HashMap::new();
     for pull_request in pull_requests.drain(..) {
         match by_url.get_mut(&pull_request.url) {
-            Some(existing) => existing.requested_via.extend(pull_request.requested_via),
+            Some(existing) => {
+                existing.requested_via.extend(pull_request.requested_via);
+                for reason in pull_request.involvement {
+                    existing.add_involvement(reason);
+                }
+            }
             None => {
                 by_url.insert(pull_request.url.clone(), pull_request);
             }
@@ -220,6 +398,150 @@ fn deduplicate_requested(pull_requests: &mut Vec<PullRequest>) {
             .retain(|name| seen.insert(name.clone()));
     }
     *pull_requests = by_url.into_values().collect();
+}
+
+#[derive(Debug, Clone)]
+struct CommitDiscovery {
+    pull_request_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CommitDiscoveryCache {
+    viewer: String,
+    refreshed_at: Instant,
+    discovery: CommitDiscovery,
+}
+
+static COMMIT_DISCOVERY_CACHE: OnceLock<Mutex<Option<CommitDiscoveryCache>>> = OnceLock::new();
+
+fn discover_committed_pull_request_ids(viewer: &str) -> Result<CommitDiscovery> {
+    let cache = COMMIT_DISCOVERY_CACHE.get_or_init(|| Mutex::new(None));
+    if let Some(cached) = cache
+        .lock()
+        .map_err(|_| anyhow!("commit discovery cache is unavailable"))?
+        .as_ref()
+        .filter(|cached| {
+            cached.viewer.eq_ignore_ascii_case(viewer)
+                && cached.refreshed_at.elapsed() < COMMIT_DISCOVERY_TTL
+        })
+    {
+        return Ok(cached.discovery.clone());
+    }
+
+    let query = format!("author:{viewer}");
+    let query_field = format!("q={query}");
+    let output = run_gh(
+        &[
+            "api",
+            "--paginate",
+            "--slurp",
+            "-X",
+            "GET",
+            "search/commits",
+            "-f",
+            &query_field,
+            "-f",
+            "per_page=100",
+            "-f",
+            "sort=author-date",
+            "-f",
+            "order=desc",
+        ],
+        None,
+    )
+    .context("could not search commits authored by you")?;
+    let pages: Vec<CommitSearchPage> =
+        serde_json::from_slice(&output).context("invalid GitHub commit-search response")?;
+    let mut seen_commits = HashSet::new();
+    let commit_ids = pages
+        .into_iter()
+        .flat_map(|page| page.items)
+        .map(|item| item.node_id)
+        .filter(|id| seen_commits.insert(id.clone()))
+        .take(GITHUB_SEARCH_LIMIT)
+        .collect::<Vec<_>>();
+
+    let mut pull_request_ids = Vec::new();
+    for chunk in commit_ids.chunks(100) {
+        let payload = NodeGraphQlRequest {
+            query: ASSOCIATED_PULL_REQUESTS_QUERY,
+            variables: NodeVariables { ids: chunk },
+        };
+        let body = serde_json::to_vec(&payload)?;
+        let output = run_gh(&["api", "graphql", "--input", "-"], Some(&body))?;
+        let response: AssociationEnvelope =
+            serde_json::from_slice(&output).context("invalid commit-to-pull-request response")?;
+        if !response.errors.is_empty() {
+            bail!(
+                "GitHub GraphQL error: {}",
+                graphql_error_text(&response.errors)
+            );
+        }
+        for association in response.data.into_iter().flat_map(|data| data.nodes) {
+            let Some(association) = association else {
+                continue;
+            };
+            pull_request_ids.extend(
+                association
+                    .associated_pull_requests
+                    .nodes
+                    .into_iter()
+                    .filter(|pull_request| pull_request.state == "OPEN")
+                    .map(|pull_request| pull_request.id),
+            );
+        }
+    }
+    let mut seen_pull_requests = HashSet::new();
+    pull_request_ids.retain(|id| seen_pull_requests.insert(id.clone()));
+    let discovery = CommitDiscovery { pull_request_ids };
+    *cache
+        .lock()
+        .map_err(|_| anyhow!("commit discovery cache is unavailable"))? =
+        Some(CommitDiscoveryCache {
+            viewer: viewer.into(),
+            refreshed_at: Instant::now(),
+            discovery: discovery.clone(),
+        });
+    Ok(discovery)
+}
+
+fn fetch_pull_requests_by_ids(ids: &[String]) -> Result<Vec<PullRequest>> {
+    let mut pull_requests = Vec::new();
+    let query = format!("{NODE_QUERY}\n{PULL_REQUEST_FRAGMENT}");
+    for chunk in ids.chunks(100) {
+        let payload = NodeGraphQlRequest {
+            query: &query,
+            variables: NodeVariables { ids: chunk },
+        };
+        let body = serde_json::to_vec(&payload)?;
+        let output = run_gh(&["api", "graphql", "--input", "-"], Some(&body))?;
+        let response: PullRequestNodesEnvelope =
+            serde_json::from_slice(&output).context("invalid pull-request node response")?;
+        if !response.errors.is_empty() {
+            bail!(
+                "GitHub GraphQL error: {}",
+                graphql_error_text(&response.errors)
+            );
+        }
+        pull_requests.extend(
+            response
+                .data
+                .into_iter()
+                .flat_map(|data| data.nodes)
+                .flatten()
+                .filter(|pull_request| pull_request.state == "OPEN")
+                .map(PullRequest::from),
+        );
+    }
+    Ok(pull_requests)
+}
+
+fn graphql_error_text(errors: &[GraphQlError]) -> String {
+    errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn run_gh(args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -274,7 +596,7 @@ struct ApiOrganization {
 }
 
 #[derive(Serialize)]
-struct GraphQlRequest<'a> {
+struct SearchGraphQlRequest<'a> {
     query: &'a str,
     variables: SearchVariables<'a>,
 }
@@ -287,6 +609,17 @@ struct SearchVariables<'a> {
     page_size: u32,
 }
 
+#[derive(Serialize)]
+struct NodeGraphQlRequest<'a> {
+    query: &'a str,
+    variables: NodeVariables<'a>,
+}
+
+#[derive(Serialize)]
+struct NodeVariables<'a> {
+    ids: &'a [String],
+}
+
 #[derive(Debug, Deserialize)]
 struct GraphQlEnvelope {
     data: Option<SearchData>,
@@ -297,6 +630,57 @@ struct GraphQlEnvelope {
 #[derive(Debug, Deserialize)]
 struct GraphQlError {
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitSearchPage {
+    items: Vec<CommitSearchItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitSearchItem {
+    node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssociationEnvelope {
+    data: Option<AssociationData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssociationData {
+    nodes: Vec<Option<ApiCommitAssociation>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiCommitAssociation {
+    associated_pull_requests: AssociatedPullRequestConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssociatedPullRequestConnection {
+    nodes: Vec<AssociatedPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssociatedPullRequest {
+    id: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestNodesEnvelope {
+    data: Option<PullRequestNodesData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestNodesData {
+    nodes: Vec<Option<ApiPullRequest>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,6 +706,7 @@ struct PageInfo {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiPullRequest {
+    state: String,
     number: u64,
     title: String,
     url: String,
@@ -337,7 +722,8 @@ struct ApiPullRequest {
     review_decision: Option<String>,
     author: Option<ApiActor>,
     repository: ApiRepository,
-    comments: CountConnection,
+    comments: CommentConnection,
+    assignees: ActorConnection,
     labels: LabelConnection,
     reviews: ReviewConnection,
     review_requests: ReviewRequestConnection,
@@ -357,8 +743,19 @@ struct ApiRepository {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CountConnection {
+struct CommentConnection {
     total_count: usize,
+    nodes: Vec<ApiComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiComment {
+    author: Option<ApiActor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorConnection {
+    nodes: Vec<ApiActor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,7 +819,18 @@ struct ApiCommitNode {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiCommit {
+    authors: CommitAuthorConnection,
     status_check_rollup: Option<ApiStatusRollup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitAuthorConnection {
+    nodes: Vec<ApiCommitAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCommitAuthor {
+    user: Option<ApiActor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,6 +930,7 @@ impl From<ApiPullRequest> for PullRequest {
                 .collect(),
             checks,
             requested_via: Vec::new(),
+            involvement: Vec::new(),
         }
     }
 }
@@ -536,6 +945,8 @@ mod tests {
         assert!(source.contains("is:pr is:open author:"));
         assert!(source.contains("is:pr is:open user-review-requested:"));
         assert!(source.contains("is:pr is:open team-review-requested:"));
+        assert!(source.contains("is:pr is:open involves:"));
+        assert!(source.contains("is:pr is:open reviewed-by:"));
     }
 
     #[test]
@@ -546,6 +957,7 @@ mod tests {
             "pageInfo": {"hasNextPage": false, "endCursor": null},
             "nodes": [{
               "number": 42,
+              "state": "OPEN",
               "title": "All review states",
               "url": "https://github.com/acme/app/pull/42",
               "isDraft": true,
@@ -560,7 +972,8 @@ mod tests {
               "reviewDecision": "CHANGES_REQUESTED",
               "author": {"login": "owner"},
               "repository": {"nameWithOwner": "acme/app"},
-              "comments": {"totalCount": 4},
+              "comments": {"totalCount": 4, "nodes": [{"author":{"login":"alice"}}]},
+              "assignees": {"nodes": [{"login":"alice"}]},
               "labels": {"nodes": [{"name": "backend"}]},
               "reviews": {"totalCount": 5, "nodes": [
                 {"author":{"login":"a"},"state":"PENDING","submittedAt":null},
@@ -573,7 +986,7 @@ mod tests {
                 {"requestedReviewer":{"__typename":"User","login":"alice"}},
                 {"requestedReviewer":{"__typename":"Team","name":"Core","slug":"core","organization":{"login":"acme"}}}
               ]},
-              "commits": {"nodes": [{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]}
+              "commits": {"nodes": [{"commit":{"authors":{"nodes":[{"user":{"login":"alice"}}]},"statusCheckRollup":{"state":"FAILURE"}}}]}
             }]
           }}
         }"#;
@@ -596,5 +1009,45 @@ mod tests {
         assert_eq!(pr.review_requests[1].name, "acme/core");
         assert_eq!(pr.checks, Some(CheckState::Failure));
         assert_eq!(pr.mergeable, MergeableState::Conflicting);
+    }
+
+    #[test]
+    fn derives_exact_involvement_reasons_from_graphql_data() {
+        let json = r#"{
+          "number": 7,
+          "state": "OPEN",
+          "title": "Participated",
+          "url": "https://github.com/acme/app/pull/7",
+          "isDraft": false,
+          "createdAt": "2026-08-01T00:00:00Z",
+          "updatedAt": "2026-08-03T00:00:00Z",
+          "additions": 1,
+          "deletions": 1,
+          "changedFiles": 1,
+          "baseRefName": "main",
+          "headRefName": "feature",
+          "mergeable": "MERGEABLE",
+          "reviewDecision": null,
+          "author": {"login": "owner"},
+          "repository": {"nameWithOwner": "acme/app"},
+          "comments": {"totalCount": 1, "nodes": [{"author":{"login":"viewer"}}]},
+          "assignees": {"nodes": [{"login":"viewer"}]},
+          "labels": {"nodes": []},
+          "reviews": {"totalCount": 1, "nodes": [
+            {"author":{"login":"viewer"},"state":"APPROVED","submittedAt":"2026-08-03T00:00:00Z"}
+          ]},
+          "reviewRequests": {"totalCount": 0, "nodes": []},
+          "commits": {"nodes": [{"commit":{"authors":{"nodes":[{"user":{"login":"viewer"}}]},"statusCheckRollup":null}}]}
+        }"#;
+        let pull_request: ApiPullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            InvolvementDiscovery::Involves("viewer").reasons(&pull_request),
+            vec![
+                InvolvementReason::Assigned,
+                InvolvementReason::Commented,
+                InvolvementReason::Reviewed,
+                InvolvementReason::Committed,
+            ]
+        );
     }
 }

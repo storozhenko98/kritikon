@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
@@ -7,19 +8,50 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::{github, model::DashboardData};
+use crate::{
+    config::{Config, parse_refresh_seconds},
+    github,
+    model::{DashboardData, InvolvementReason, PullRequest},
+};
+#[cfg(debug_assertions)]
+use crate::{dev, dev::DevScenario};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
-    Requested,
+    ReviewQueue,
+    Involved,
     Owned,
 }
 
 impl Tab {
     pub fn index(self) -> usize {
         match self {
-            Self::Requested => 0,
-            Self::Owned => 1,
+            Self::ReviewQueue => 0,
+            Self::Involved => 1,
+            Self::Owned => 2,
+        }
+    }
+
+    fn cycle(self, delta: isize) -> Self {
+        const TABS: [Tab; 3] = [Tab::ReviewQueue, Tab::Involved, Tab::Owned];
+        let index = self.index();
+        TABS[(index as isize + delta).rem_euclid(TABS.len() as isize) as usize]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSource {
+    Github,
+    #[cfg(debug_assertions)]
+    Dev(DevScenario),
+}
+
+impl DataSource {
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Github => None,
+            #[cfg(debug_assertions)]
+            Self::Dev(scenario) => Some(scenario.label()),
         }
     }
 }
@@ -30,6 +62,9 @@ pub enum Action {
     Quit,
     Refresh,
     Open(String),
+    CopyBranch(String),
+    SaveConfig(Config),
+    ResetConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -38,75 +73,173 @@ pub struct RowHitbox {
     pub index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFocus {
+    Refresh,
+    Save,
+    Reset,
+    Cancel,
+}
+
+impl ConfigFocus {
+    fn cycle(self, delta: isize) -> Self {
+        const FIELDS: [ConfigFocus; 4] = [
+            ConfigFocus::Refresh,
+            ConfigFocus::Save,
+            ConfigFocus::Reset,
+            ConfigFocus::Cancel,
+        ];
+        let index = FIELDS.iter().position(|field| *field == self).unwrap_or(0);
+        FIELDS[(index as isize + delta).rem_euclid(FIELDS.len() as isize) as usize]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigEditor {
+    pub refresh_input: String,
+    pub refresh_pristine: bool,
+    pub focus: ConfigFocus,
+    pub error: Option<String>,
+    pub confirm_reset: bool,
+}
+
+impl ConfigEditor {
+    fn new(config: Config, error: Option<String>) -> Self {
+        Self {
+            refresh_input: config.refresh_seconds.to_string(),
+            refresh_pristine: true,
+            focus: ConfigFocus::Refresh,
+            error,
+            confirm_reset: false,
+        }
+    }
+
+    fn config(&self) -> Result<Config, String> {
+        let seconds = parse_refresh_seconds(&self.refresh_input)?;
+        Config::new(seconds).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConfigHitboxes {
+    pub refresh: Rect,
+    pub save: Rect,
+    pub reset: Rect,
+    pub cancel: Rect,
+}
+
 pub struct App {
     pub data: Option<DashboardData>,
     pub tab: Tab,
-    pub selected: [usize; 2],
-    pub offsets: [usize; 2],
+    pub selected: [usize; 3],
+    pub offsets: [usize; 3],
     pub visible_rows: usize,
     pub loading: bool,
+    pub commit_loading: bool,
     pub error: Option<String>,
     pub show_help: bool,
     pub details_expanded: bool,
     pub detail_scroll: u16,
     pub detail_max_scroll: u16,
     pub row_hitboxes: Vec<RowHitbox>,
-    pub tab_hitboxes: [Rect; 2],
+    pub tab_hitboxes: [Rect; 3],
     pub notice: Option<(String, Instant)>,
-    pub include_team_requests: bool,
-    pub refresh_interval: Option<Duration>,
-    pub next_refresh: Option<Instant>,
-    refresh_receiver: Option<Receiver<Result<DashboardData, String>>>,
+    pub config: Config,
+    pub config_path: PathBuf,
+    pub config_editor: Option<ConfigEditor>,
+    pub config_hitboxes: ConfigHitboxes,
+    pub refresh_remaining: Duration,
+    pub data_source: DataSource,
+    refresh_receiver: Option<Receiver<RefreshMessage>>,
+    commit_receiver: Option<Receiver<Result<github::CommitInvolvement, String>>>,
+    committed_pull_requests: Vec<PullRequest>,
+    commit_warnings: Vec<String>,
+    refresh_generation: u64,
+    refresh_requested: bool,
+    last_timer_tick: Instant,
 }
 
 impl App {
-    pub fn new(include_team_requests: bool, refresh_seconds: u64) -> Self {
+    pub fn new(config: Config, config_path: PathBuf, data_source: DataSource) -> Self {
         Self {
             data: None,
-            tab: Tab::Requested,
-            selected: [0, 0],
-            offsets: [0, 0],
+            tab: Tab::ReviewQueue,
+            selected: [0, 0, 0],
+            offsets: [0, 0, 0],
             visible_rows: 1,
             loading: false,
+            commit_loading: false,
             error: None,
             show_help: false,
             details_expanded: false,
             detail_scroll: 0,
             detail_max_scroll: 0,
             row_hitboxes: Vec::new(),
-            tab_hitboxes: [Rect::default(), Rect::default()],
+            tab_hitboxes: [Rect::default(), Rect::default(), Rect::default()],
             notice: None,
-            include_team_requests,
-            refresh_interval: (refresh_seconds > 0).then(|| Duration::from_secs(refresh_seconds)),
-            next_refresh: None,
+            config,
+            config_path,
+            config_editor: None,
+            config_hitboxes: ConfigHitboxes::default(),
+            refresh_remaining: Duration::ZERO,
+            data_source,
             refresh_receiver: None,
+            commit_receiver: None,
+            committed_pull_requests: Vec::new(),
+            commit_warnings: Vec::new(),
+            refresh_generation: 0,
+            refresh_requested: false,
+            last_timer_tick: Instant::now(),
         }
     }
 
     #[cfg(test)]
     pub fn with_data(data: DashboardData) -> Self {
-        let mut app = Self::new(true, 0);
+        let mut app = Self::new(
+            Config::default(),
+            PathBuf::from("/tmp/kritikon-test.toml"),
+            DataSource::Github,
+        );
         app.data = Some(data);
         app
     }
 
+    pub fn open_config(&mut self, error: Option<String>) {
+        self.show_help = false;
+        self.config_editor = Some(ConfigEditor::new(self.config, error));
+    }
+
     pub fn begin_refresh(&mut self) {
         if self.loading {
+            self.refresh_requested = true;
             return;
         }
         self.loading = true;
         self.error = None;
-        let include_team_requests = self.include_team_requests;
+        let source = self.data_source;
+        #[cfg(debug_assertions)]
+        let generation = self.refresh_generation;
+        self.refresh_generation = self.refresh_generation.saturating_add(1);
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let result = github::fetch_dashboard(include_team_requests)
-                .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(result);
+            let result = match source {
+                DataSource::Github => github::fetch_dashboard(),
+                #[cfg(debug_assertions)]
+                DataSource::Dev(scenario) => dev::fetch_dashboard(scenario, generation),
+            }
+            .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(RefreshMessage { result });
         });
         self.refresh_receiver = Some(receiver);
     }
 
     pub fn tick(&mut self) {
+        let now = Instant::now();
+        self.refresh_remaining = self
+            .refresh_remaining
+            .saturating_sub(now.saturating_duration_since(self.last_timer_tick));
+        self.last_timer_tick = now;
+
         if let Some((_, expires_at)) = &self.notice
             && Instant::now() >= *expires_at
         {
@@ -118,15 +251,16 @@ impl App {
             .as_ref()
             .map(|receiver| receiver.try_recv());
         match received {
-            Some(Ok(Ok(data))) => {
-                self.data = Some(data);
+            Some(Ok(RefreshMessage { result: Ok(data) })) => {
+                let viewer = data.viewer.clone();
+                self.apply_refresh(data);
                 self.loading = false;
                 self.error = None;
                 self.refresh_receiver = None;
-                self.clamp_selection();
                 self.schedule_next_refresh();
+                self.begin_commit_enrichment(viewer);
             }
-            Some(Ok(Err(error))) => {
+            Some(Ok(RefreshMessage { result: Err(error) })) => {
                 self.loading = false;
                 self.error = Some(error);
                 self.refresh_receiver = None;
@@ -141,29 +275,163 @@ impl App {
             Some(Err(TryRecvError::Empty)) | None => {}
         }
 
-        if !self.loading
-            && self
-                .next_refresh
-                .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        let commit_received = self
+            .commit_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+        match commit_received {
+            Some(Ok(Ok(commit_involvement))) => {
+                self.commit_loading = false;
+                self.commit_receiver = None;
+                if let Some(data) = &mut self.data {
+                    strip_commit_involvement(data, &self.committed_pull_requests);
+                    data.warnings
+                        .retain(|warning| !self.commit_warnings.contains(warning));
+                }
+                self.committed_pull_requests = commit_involvement.pull_requests;
+                self.commit_warnings.clear();
+                if let Some(data) = &mut self.data {
+                    merge_commit_involvement(
+                        data,
+                        &self.committed_pull_requests,
+                        &self.commit_warnings,
+                    );
+                }
+            }
+            Some(Ok(Err(error))) => {
+                self.commit_loading = false;
+                self.commit_receiver = None;
+                self.commit_warnings = vec![format!(
+                    "Commit-based involvement is temporarily unavailable ({error})"
+                )];
+                if let Some(data) = &mut self.data {
+                    merge_commit_involvement(data, &[], &self.commit_warnings);
+                }
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.commit_loading = false;
+                self.commit_receiver = None;
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
+        if !self.loading && std::mem::take(&mut self.refresh_requested) {
+            self.begin_refresh();
+            return;
+        }
+
+        if !self.loading && self.refresh_remaining.is_zero() {
             self.begin_refresh();
         }
     }
 
+    fn apply_refresh(&mut self, data: DashboardData) {
+        let mut data = data;
+        merge_commit_involvement(
+            &mut data,
+            &self.committed_pull_requests,
+            &self.commit_warnings,
+        );
+        let anchors = [
+            self.selection_anchor(Tab::ReviewQueue),
+            self.selection_anchor(Tab::Involved),
+            self.selection_anchor(Tab::Owned),
+        ];
+        let active_url = self.selected_url();
+        self.data = Some(data);
+
+        for (tab, anchor) in [
+            (Tab::ReviewQueue, &anchors[0]),
+            (Tab::Involved, &anchors[1]),
+            (Tab::Owned, &anchors[2]),
+        ] {
+            let tab_index = tab.index();
+            let (new_index, item_count) = {
+                let items = self.items_for(tab);
+                let new_index = anchor
+                    .url
+                    .as_ref()
+                    .and_then(|url| {
+                        items
+                            .iter()
+                            .position(|pull_request| &pull_request.url == url)
+                    })
+                    .unwrap_or_else(|| self.selected[tab_index].min(items.len().saturating_sub(1)));
+                (new_index, items.len())
+            };
+            self.selected[tab_index] = new_index;
+            self.offsets[tab_index] = new_index
+                .saturating_sub(anchor.row)
+                .min(item_count.saturating_sub(self.visible_rows));
+        }
+
+        if active_url != self.selected_url() {
+            self.detail_scroll = 0;
+        }
+        self.ensure_visible();
+    }
+
+    fn begin_commit_enrichment(&mut self, viewer: String) {
+        if self.commit_loading || self.data_source != DataSource::Github {
+            return;
+        }
+        self.commit_loading = true;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result =
+                github::fetch_commit_involvement(&viewer).map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+        self.commit_receiver = Some(receiver);
+    }
+
+    fn selection_anchor(&self, tab: Tab) -> SelectionAnchor {
+        let index = self.selected[tab.index()];
+        SelectionAnchor {
+            url: self
+                .items_for(tab)
+                .get(index)
+                .map(|pull_request| pull_request.url.clone()),
+            row: index.saturating_sub(self.offsets[tab.index()]),
+        }
+    }
+
     fn schedule_next_refresh(&mut self) {
-        self.next_refresh = self
-            .refresh_interval
-            .map(|interval| Instant::now() + interval);
+        self.refresh_remaining = Duration::from_secs(self.config.refresh_seconds);
+        self.last_timer_tick = Instant::now();
+    }
+
+    pub fn apply_config(&mut self, config: Config, reset: bool) {
+        self.config = config;
+        self.config_editor = None;
+        self.schedule_next_refresh();
+        self.set_notice(if reset {
+            "Configuration reset to defaults and file deleted"
+        } else {
+            "Configuration saved"
+        });
+    }
+
+    pub fn config_write_failed(&mut self, error: impl Into<String>) {
+        if let Some(editor) = &mut self.config_editor {
+            editor.error = Some(error.into());
+            editor.confirm_reset = false;
+        }
+    }
+
+    fn items_for(&self, tab: Tab) -> &[crate::model::PullRequest] {
+        let Some(data) = &self.data else {
+            return &[];
+        };
+        match tab {
+            Tab::ReviewQueue => &data.review_queue,
+            Tab::Involved => &data.involved,
+            Tab::Owned => &data.owned,
+        }
     }
 
     pub fn items_len(&self) -> usize {
-        let Some(data) = &self.data else {
-            return 0;
-        };
-        match self.tab {
-            Tab::Requested => data.requested.len(),
-            Tab::Owned => data.owned.len(),
-        }
+        self.items_for(self.tab).len()
     }
 
     pub fn selected_index(&self) -> usize {
@@ -195,32 +463,33 @@ impl App {
         self.selected[index] = self.selected[index]
             .saturating_add_signed(delta)
             .min(len.saturating_sub(1));
+        self.detail_scroll = 0;
         self.ensure_visible();
     }
 
     pub fn select(&mut self, selected: usize) {
         if selected < self.items_len() {
             self.selected[self.tab.index()] = selected;
+            self.detail_scroll = 0;
             self.ensure_visible();
         }
     }
 
     pub fn select_home(&mut self) {
         self.selected[self.tab.index()] = 0;
+        self.detail_scroll = 0;
         self.ensure_visible();
     }
 
     pub fn select_end(&mut self) {
         self.selected[self.tab.index()] = self.items_len().saturating_sub(1);
+        self.detail_scroll = 0;
         self.ensure_visible();
     }
 
     fn clamp_selection(&mut self) {
-        for (tab, index) in [(Tab::Requested, 0), (Tab::Owned, 1)] {
-            let len = self.data.as_ref().map_or(0, |data| match tab {
-                Tab::Requested => data.requested.len(),
-                Tab::Owned => data.owned.len(),
-            });
+        for (tab, index) in [(Tab::ReviewQueue, 0), (Tab::Involved, 1), (Tab::Owned, 2)] {
+            let len = self.items_for(tab).len();
             self.selected[index] = self.selected[index].min(len.saturating_sub(1));
             self.offsets[index] = self.offsets[index].min(self.selected[index]);
         }
@@ -237,12 +506,15 @@ impl App {
     }
 
     pub fn selected_url(&self) -> Option<String> {
-        let data = self.data.as_ref()?;
-        let pull_request = match self.tab {
-            Tab::Requested => data.requested.get(self.selected_index()),
-            Tab::Owned => data.owned.get(self.selected_index()),
-        }?;
-        Some(pull_request.url.clone())
+        self.items_for(self.tab)
+            .get(self.selected_index())
+            .map(|pull_request| pull_request.url.clone())
+    }
+
+    pub fn selected_branch(&self) -> Option<String> {
+        self.items_for(self.tab)
+            .get(self.selected_index())
+            .map(|pull_request| pull_request.head_ref.clone())
     }
 
     pub fn set_notice(&mut self, message: impl Into<String>) {
@@ -252,6 +524,9 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
+        }
+        if self.config_editor.is_some() {
+            return self.handle_config_key(key);
         }
 
         if self.show_help {
@@ -307,24 +582,25 @@ impl App {
                 self.show_help = true;
                 Action::None
             }
+            KeyCode::Char('t') => {
+                self.open_config(None);
+                Action::None
+            }
+            KeyCode::Char('c') => self
+                .selected_branch()
+                .map(Action::CopyBranch)
+                .unwrap_or(Action::None),
             KeyCode::Char('d') => {
                 self.details_expanded = !self.details_expanded;
                 self.detail_scroll = 0;
                 Action::None
             }
-            KeyCode::Char('1') => {
-                self.set_tab(Tab::Requested);
+            KeyCode::Tab | KeyCode::Right => {
+                self.set_tab(self.tab.cycle(1));
                 Action::None
             }
-            KeyCode::Char('2') => {
-                self.set_tab(Tab::Owned);
-                Action::None
-            }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
-                self.set_tab(match self.tab {
-                    Tab::Requested => Tab::Owned,
-                    Tab::Owned => Tab::Requested,
-                });
+            KeyCode::BackTab | KeyCode::Left => {
+                self.set_tab(self.tab.cycle(-1));
                 Action::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -360,9 +636,94 @@ impl App {
         }
     }
 
+    fn handle_config_key(&mut self, key: KeyEvent) -> Action {
+        let editor = self.config_editor.as_mut().expect("editor exists");
+        if editor.confirm_reset {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('x') | KeyCode::Enter => Action::ResetConfig,
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    editor.confirm_reset = false;
+                    editor.error = None;
+                    Action::None
+                }
+                _ => Action::None,
+            };
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.config_editor = None;
+                Action::None
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                editor.focus = editor.focus.cycle(1);
+                Action::None
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                editor.focus = editor.focus.cycle(-1);
+                Action::None
+            }
+            KeyCode::Char('s') => self.config_save_action(),
+            KeyCode::Char('x') => {
+                editor.confirm_reset = true;
+                editor.error = None;
+                Action::None
+            }
+            KeyCode::Enter => match editor.focus {
+                ConfigFocus::Reset => {
+                    editor.confirm_reset = true;
+                    Action::None
+                }
+                ConfigFocus::Cancel => {
+                    self.config_editor = None;
+                    Action::None
+                }
+                _ => self.config_save_action(),
+            },
+            KeyCode::Char(character)
+                if editor.focus == ConfigFocus::Refresh && character.is_ascii_digit() =>
+            {
+                if editor.refresh_pristine {
+                    editor.refresh_input.clear();
+                    editor.refresh_pristine = false;
+                }
+                editor.refresh_input.push(character);
+                editor.error = None;
+                Action::None
+            }
+            KeyCode::Backspace if editor.focus == ConfigFocus::Refresh => {
+                editor.refresh_pristine = false;
+                editor.refresh_input.pop();
+                editor.error = None;
+                Action::None
+            }
+            KeyCode::Delete if editor.focus == ConfigFocus::Refresh => {
+                editor.refresh_pristine = false;
+                editor.refresh_input.clear();
+                editor.error = None;
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn config_save_action(&mut self) -> Action {
+        let editor = self.config_editor.as_mut().expect("editor exists");
+        match editor.config() {
+            Ok(config) => Action::SaveConfig(config),
+            Err(error) => {
+                editor.error = Some(error);
+                Action::None
+            }
+        }
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
         if self.show_help {
             return Action::None;
+        }
+        if self.config_editor.is_some() {
+            return self.handle_config_mouse(mouse);
         }
 
         match mouse.kind {
@@ -386,10 +747,14 @@ impl App {
                 let x = mouse.column;
                 let y = mouse.row;
                 if contains(self.tab_hitboxes[0], x, y) {
-                    self.set_tab(Tab::Requested);
+                    self.set_tab(Tab::ReviewQueue);
                     return Action::None;
                 }
                 if contains(self.tab_hitboxes[1], x, y) {
+                    self.set_tab(Tab::Involved);
+                    return Action::None;
+                }
+                if contains(self.tab_hitboxes[2], x, y) {
                     self.set_tab(Tab::Owned);
                     return Action::None;
                 }
@@ -411,6 +776,43 @@ impl App {
         }
     }
 
+    fn handle_config_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return Action::None;
+        }
+        let x = mouse.column;
+        let y = mouse.row;
+        let hitboxes = self.config_hitboxes.clone();
+        let editor = self.config_editor.as_mut().expect("editor exists");
+        if editor.confirm_reset {
+            if contains(hitboxes.reset, x, y) {
+                return Action::ResetConfig;
+            }
+            if contains(hitboxes.cancel, x, y) {
+                editor.confirm_reset = false;
+                editor.error = None;
+            }
+            return Action::None;
+        }
+        if contains(hitboxes.refresh, x, y) {
+            editor.focus = ConfigFocus::Refresh;
+            return Action::None;
+        }
+        if contains(hitboxes.save, x, y) {
+            editor.focus = ConfigFocus::Save;
+            return self.config_save_action();
+        }
+        if contains(hitboxes.reset, x, y) {
+            editor.focus = ConfigFocus::Reset;
+            editor.confirm_reset = true;
+            return Action::None;
+        }
+        if contains(hitboxes.cancel, x, y) {
+            self.config_editor = None;
+        }
+        Action::None
+    }
+
     fn scroll_details(&mut self, delta: isize) {
         let distance = delta.unsigned_abs().min(u16::MAX as usize) as u16;
         self.detail_scroll = if delta.is_negative() {
@@ -422,6 +824,56 @@ impl App {
     }
 }
 
+fn merge_commit_involvement(
+    data: &mut DashboardData,
+    committed: &[PullRequest],
+    warnings: &[String],
+) {
+    for committed_pr in committed {
+        if let Some(existing) = data
+            .involved
+            .iter_mut()
+            .find(|pull_request| pull_request.url == committed_pr.url)
+        {
+            existing.add_involvement(InvolvementReason::Committed);
+        } else {
+            data.involved.push(committed_pr.clone());
+        }
+    }
+    data.involved
+        .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    for warning in warnings {
+        if !data.warnings.contains(warning) {
+            data.warnings.push(warning.clone());
+        }
+    }
+}
+
+fn strip_commit_involvement(data: &mut DashboardData, previously_committed: &[PullRequest]) {
+    let urls = previously_committed
+        .iter()
+        .map(|pull_request| pull_request.url.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for pull_request in &mut data.involved {
+        if urls.contains(pull_request.url.as_str()) {
+            pull_request
+                .involvement
+                .retain(|reason| *reason != InvolvementReason::Committed);
+        }
+    }
+    data.involved
+        .retain(|pull_request| !pull_request.involvement.is_empty());
+}
+
+struct SelectionAnchor {
+    url: Option<String>,
+    row: usize,
+}
+
+struct RefreshMessage {
+    result: Result<DashboardData, String>,
+}
+
 fn contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x
         && x < rect.x.saturating_add(rect.width)
@@ -431,8 +883,9 @@ fn contains(rect: Rect, x: u16, y: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{CheckState, MergeableState, PullRequest};
     use chrono::Utc;
+
+    use crate::model::{CheckState, MergeableState, PullRequest};
 
     use super::*;
 
@@ -461,18 +914,32 @@ mod tests {
             labels: vec![],
             checks: Some(CheckState::Success),
             requested_via: vec!["@viewer".into()],
+            involvement: vec![],
+        }
+    }
+
+    fn dashboard(
+        review_queue: Vec<PullRequest>,
+        involved: Vec<PullRequest>,
+        owned: Vec<PullRequest>,
+    ) -> DashboardData {
+        DashboardData {
+            viewer: "viewer".into(),
+            review_queue,
+            involved,
+            owned,
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec!["acme/core".into()],
         }
     }
 
     fn app() -> App {
-        App::with_data(DashboardData {
-            viewer: "viewer".into(),
-            requested: vec![pr(1), pr(2), pr(3), pr(4)],
-            owned: vec![pr(5)],
-            warnings: vec![],
-            fetched_at: Utc::now(),
-            team_count: 1,
-        })
+        App::with_data(dashboard(
+            vec![pr(1), pr(2), pr(3), pr(4)],
+            vec![pr(6), pr(7)],
+            vec![pr(5)],
+        ))
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -494,6 +961,10 @@ mod tests {
         );
 
         app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.tab, Tab::ReviewQueue);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Involved);
+        app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Owned);
         assert_eq!(app.items_len(), 1);
     }
@@ -520,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn details_can_be_expanded_and_escape_returns_to_the_list() {
+    fn details_can_be_expanded_and_scrolled() {
         let mut app = app();
         app.handle_key(key(KeyCode::Char('d')));
         assert!(app.details_expanded);
@@ -532,5 +1003,147 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.details_expanded);
         assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn refresh_preserves_the_selected_pr_and_its_screen_row() {
+        let mut app = app();
+        app.set_visible_rows(2);
+        app.select(2);
+        assert_eq!(app.offset(), 1);
+        let selected = app.selected_url();
+
+        app.apply_refresh(dashboard(
+            vec![pr(4), pr(3), pr(2), pr(1)],
+            vec![pr(7), pr(6)],
+            vec![pr(5)],
+        ));
+
+        assert_eq!(app.selected_url(), selected);
+        assert_eq!(app.selected_index() - app.offset(), 1);
+    }
+
+    #[test]
+    fn commit_enrichment_merges_reasons_without_duplicate_rows() {
+        let mut commented = pr(6);
+        commented.involvement = vec![InvolvementReason::Commented];
+        let mut data = dashboard(vec![], vec![commented], vec![]);
+        let mut committed_existing = pr(6);
+        committed_existing.involvement = vec![InvolvementReason::Committed];
+        let mut committed_only = pr(8);
+        committed_only.involvement = vec![InvolvementReason::Committed];
+
+        merge_commit_involvement(
+            &mut data,
+            &[committed_existing, committed_only],
+            &["commit scan note".into()],
+        );
+
+        assert_eq!(data.involved.len(), 2);
+        let existing = data
+            .involved
+            .iter()
+            .find(|pull_request| pull_request.number == 6)
+            .unwrap();
+        assert_eq!(
+            existing.involvement,
+            vec![InvolvementReason::Committed, InvolvementReason::Commented]
+        );
+        assert_eq!(data.warnings, vec!["commit scan note"]);
+    }
+
+    #[test]
+    fn configuration_editor_validates_and_builds_actions() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Char('t')));
+        let editor = app.config_editor.as_mut().unwrap();
+        editor.refresh_input = "4".into();
+        assert_eq!(app.handle_key(key(KeyCode::Char('s'))), Action::None);
+        assert!(app.config_editor.as_ref().unwrap().error.is_some());
+
+        app.config_editor.as_mut().unwrap().refresh_input = "60".into();
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('s'))),
+            Action::SaveConfig(Config::new(60).unwrap())
+        );
+    }
+
+    #[test]
+    fn reset_requires_confirmation() {
+        let mut app = app();
+        app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Action::None);
+        assert!(app.config_editor.as_ref().unwrap().confirm_reset);
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Action::ResetConfig);
+    }
+
+    #[test]
+    fn copy_and_timer_shortcuts_are_unambiguous() {
+        let mut app = app();
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('c'))),
+            Action::CopyBranch("feature".into())
+        );
+        assert!(app.config_editor.is_none());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('t'))), Action::None);
+        assert!(app.config_editor.is_some());
+    }
+
+    #[test]
+    fn maximum_u64_interval_is_schedulable_without_overflow() {
+        let mut app = app();
+        app.apply_config(Config::new(u64::MAX).unwrap(), false);
+        assert_eq!(app.refresh_remaining.as_secs(), u64::MAX);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn refresh_work_starts_in_the_background() {
+        let mut app = App::new(
+            Config::new(5).unwrap(),
+            PathBuf::from("/tmp/kritikon-test.toml"),
+            DataSource::Dev(DevScenario::AllStates),
+        );
+        let started = Instant::now();
+        app.begin_refresh();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(app.loading);
+        assert!(app.data.is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.loading && Instant::now() < deadline {
+            app.tick();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.loading);
+        assert!(app.data.is_some());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn repeated_refresh_requests_are_coalesced() {
+        let mut app = App::new(
+            Config::new(5).unwrap(),
+            PathBuf::from("/tmp/kritikon-test.toml"),
+            DataSource::Dev(DevScenario::AllStates),
+        );
+        app.begin_refresh();
+        app.begin_refresh();
+        app.begin_refresh();
+        assert!(app.refresh_requested);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (app.loading || app.refresh_generation < 2) && Instant::now() < deadline {
+            app.tick();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!app.loading);
+        let data = app.data.as_ref().unwrap();
+        assert!(!data.review_queue.is_empty());
+        assert!(!data.involved.is_empty());
+        assert_eq!(app.refresh_generation, 2);
     }
 }

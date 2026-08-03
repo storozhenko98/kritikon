@@ -1,70 +1,168 @@
 mod app;
+mod clipboard;
+mod config;
+#[cfg(debug_assertions)]
+mod dev;
 mod github;
 mod model;
 mod ui;
+mod updater;
 
 use std::{
     io::{self, stdout},
     time::Duration,
 };
 
-use anyhow::{Context, Result};
-use app::{Action, App};
+use anyhow::{Context, Result, bail};
+use app::{Action, App, DataSource};
 use clap::Parser;
+use config::{Config, ConfigStore, parse_refresh_seconds};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+#[cfg(debug_assertions)]
+use dev::DevScenario;
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "review-monitor",
+    name = "kritikon",
     version,
-    about = "A calm, complete terminal dashboard for GitHub pull-request reviews"
+    about = "A focused GitHub pull-request command center for your terminal"
 )]
 struct Cli {
-    /// Automatic refresh interval in seconds; use 0 to disable.
-    #[arg(long, default_value_t = 300)]
-    refresh_seconds: u64,
+    /// Override the configured refresh interval for this run (whole seconds, minimum 5).
+    #[arg(long, value_parser = parse_refresh_seconds)]
+    refresh_seconds: Option<u64>,
 
-    /// Show only review requests made directly to you, not your teams.
-    #[arg(long)]
-    no_team_requests: bool,
+    /// Delete the saved configuration and restore defaults, then exit.
+    #[arg(long, conflicts_with_all = ["check", "refresh_seconds"])]
+    reset_config: bool,
 
-    /// Fetch data, print scope/counts, and exit without starting the TUI.
+    /// Fetch data, print configuration/counts, and exit without starting the TUI.
     #[arg(long)]
     check: bool,
+
+    /// Use generated data for UI development without calling GitHub.
+    #[cfg(debug_assertions)]
+    #[arg(long, value_enum)]
+    dev_scenario: Option<DevScenario>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let include_team_requests = !cli.no_team_requests;
+    let store = config_store(&cli)?;
 
+    if cli.reset_config {
+        let deleted = store.reset()?;
+        println!(
+            "{} {}",
+            if deleted {
+                "Deleted"
+            } else {
+                "No config found at"
+            },
+            store.path().display()
+        );
+        println!(
+            "Defaults: {} seconds; all direct and team review requests are always included",
+            Config::default().refresh_seconds
+        );
+        return Ok(());
+    }
+
+    let (mut settings, config_error) = match store.load_or_default() {
+        Ok(config) => (config, None),
+        Err(error) => (Config::default(), Some(format!("{error:#}"))),
+    };
+    if let Some(seconds) = cli.refresh_seconds {
+        settings.refresh_seconds = seconds;
+    }
+    settings.validate()?;
+
+    let source = data_source(&cli);
     if cli.check {
-        let data = github::fetch_dashboard(include_team_requests)?;
-        println!("Authenticated as @{}", data.viewer);
-        println!("Review requested: {} open PR(s)", data.requested.len());
-        println!("My PRs:           {} open PR(s)", data.owned.len());
-        if include_team_requests {
-            println!("Team scope:       {} team(s) checked", data.team_count);
-        } else {
-            println!("Team scope:       disabled");
+        if let Some(error) = config_error {
+            bail!(
+                "{error}\nRun `kritikon --reset-config` or launch the TUI and press t to repair it."
+            );
         }
+        let data = fetch_once(source)?;
+        println!("Authenticated as @{}", data.viewer);
+        println!("To review:        {} open PR(s)", data.review_queue.len());
+        println!("Involved:         {} open PR(s)", data.involved.len());
+        println!("My PRs:           {} open PR(s)", data.owned.len());
+        println!("Refresh:          {} seconds", settings.refresh_seconds);
+        println!("Teams monitored:  {}", data.teams.len());
+        for team in &data.teams {
+            println!("  - {team}");
+        }
+        println!("Config:           {}", store.path().display());
         for warning in data.warnings {
             println!("Warning:          {warning}");
         }
         return Ok(());
     }
 
-    run_tui(include_team_requests, cli.refresh_seconds)
+    if updater::check_and_prompt() == updater::StartupAction::RestartRequired {
+        return Ok(());
+    }
+
+    run_tui(settings, store, source, config_error)
 }
 
-fn run_tui(include_team_requests: bool, refresh_seconds: u64) -> Result<()> {
+fn config_store(cli: &Cli) -> Result<ConfigStore> {
+    #[cfg(debug_assertions)]
+    if cli.dev_scenario.is_some() {
+        return Ok(ConfigStore::at(
+            std::env::current_dir()
+                .context("could not determine current directory for development config")?
+                .join("target/kritikon-dev/config.toml"),
+        ));
+    }
+    let _ = cli;
+    ConfigStore::system()
+}
+
+fn data_source(cli: &Cli) -> DataSource {
+    #[cfg(debug_assertions)]
+    if let Some(scenario) = cli.dev_scenario {
+        return DataSource::Dev(scenario);
+    }
+    let _ = cli;
+    DataSource::Github
+}
+
+fn fetch_once(source: DataSource) -> Result<model::DashboardData> {
+    match source {
+        DataSource::Github => github::fetch_complete_dashboard(),
+        #[cfg(debug_assertions)]
+        DataSource::Dev(scenario) => dev::fetch_dashboard(scenario, 0),
+    }
+}
+
+fn run_tui(
+    settings: Config,
+    store: ConfigStore,
+    source: DataSource,
+    config_error: Option<String>,
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
-    let mut app = App::new(include_team_requests, refresh_seconds);
+    let mut app = App::new(settings, store.path().to_path_buf(), source);
+    if let Some(error) = config_error {
+        app.open_config(Some(format!(
+            "Saved configuration is invalid; safe defaults are active. {error}"
+        )));
+    }
+    #[cfg(debug_assertions)]
+    if source == DataSource::Dev(DevScenario::ConfigError) {
+        app.open_config(Some(
+            "Simulated invalid configuration. Save valid values or reset it.".into(),
+        ));
+    }
     app.begin_refresh();
 
     loop {
@@ -73,7 +171,7 @@ fn run_tui(include_team_requests: bool, refresh_seconds: u64) -> Result<()> {
             .draw(|frame| ui::render(frame, &mut app))
             .context("could not draw the terminal interface")?;
 
-        if event::poll(Duration::from_millis(100)).context("could not poll terminal input")? {
+        if event::poll(Duration::from_millis(50)).context("could not poll terminal input")? {
             let action = match event::read().context("could not read terminal input")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
@@ -87,6 +185,20 @@ fn run_tui(include_team_requests: bool, refresh_seconds: u64) -> Result<()> {
                 Action::Open(url) => match open::that_detached(&url) {
                     Ok(()) => app.set_notice("Opened selected PR in your browser"),
                     Err(error) => app.set_notice(format!("Could not open browser: {error}")),
+                },
+                Action::CopyBranch(branch) => match clipboard::copy(&branch) {
+                    Ok(()) => app.set_notice(format!("Copied branch: {branch}")),
+                    Err(error) => {
+                        app.set_notice(format!("Could not copy branch: {error:#}"));
+                    }
+                },
+                Action::SaveConfig(config) => match store.save(&config) {
+                    Ok(()) => app.apply_config(config, false),
+                    Err(error) => app.config_write_failed(format!("Could not save: {error:#}")),
+                },
+                Action::ResetConfig => match store.reset() {
+                    Ok(_) => app.apply_config(Config::default(), true),
+                    Err(error) => app.config_write_failed(format!("Could not reset: {error:#}")),
                 },
             }
         }
@@ -118,5 +230,25 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_refresh_values_are_always_validated_as_seconds() {
+        assert!(Cli::try_parse_from(["kritikon", "--refresh-seconds", "4"]).is_err());
+        assert!(Cli::try_parse_from(["kritikon", "--refresh-seconds", "5s"]).is_err());
+        assert!(Cli::try_parse_from(["kritikon", "--refresh-seconds", "5"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kritikon", "--refresh-seconds", &u64::MAX.to_string(),]).is_ok()
+        );
+    }
+
+    #[test]
+    fn removed_scope_flag_is_rejected() {
+        assert!(Cli::try_parse_from(["kritikon", "--review-scope", "teams"]).is_err());
     }
 }

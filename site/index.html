@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101518">
+    <meta name="description" content="Kritikon is a fast terminal command center for GitHub pull-request reviews.">
+    <link rel="canonical" href="https://storozhenko98.github.io/kritikon/">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Kritikon — attention for the review queue">
+    <meta property="og:description" content="See every open PR waiting on you, every PR you touched, and every review state—without leaving the terminal.">
+    <meta property="og:url" content="https://storozhenko98.github.io/kritikon/">
+    <meta property="og:image" content="https://storozhenko98.github.io/kritikon/og.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="Kritikon — Attention for the review queue.">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Kritikon — attention for the review queue">
+    <meta name="twitter:description" content="A focused GitHub pull-request command center for your terminal.">
+    <meta name="twitter:image" content="https://storozhenko98.github.io/kritikon/og.png">
+    <title>Kritikon — attention for the review queue</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="#top" aria-label="Kritikon home">
+        <span class="mark" aria-hidden="true">Κ</span>
+        <span>KRITIKON</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#capabilities">Capabilities</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/storozhenko98/kritikon">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">THE FACULTY OF JUDGMENT</p>
+          <h1 id="hero-title">Attention for the review queue.</h1>
+          <p class="lede">
+            Kritikon turns GitHub pull requests into one calm command center:
+            what needs your review, what you have touched, and what is happening on your own PRs.
+          </p>
+
+          <div class="hero-actions">
+            <a class="button primary" href="#install">Install Kritikon</a>
+            <a class="button secondary" href="https://github.com/storozhenko98/kritikon">View source</a>
+          </div>
+
+          <div class="proof-row" aria-label="Project details">
+            <span>Open source</span>
+            <span>Apache-2.0</span>
+            <span>macOS + Linux</span>
+          </div>
+        </div>
+
+        <div class="terminal-shell" aria-label="Kritikon terminal interface preview">
+          <div class="terminal-bar">
+            <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
+            <span>kritikon</span>
+          </div>
+          <div class="terminal">
+            <div class="terminal-heading">
+              <strong> KRITIKON </strong><b>@you</b>
+            </div>
+            <div class="terminal-meta">Open PRs only&nbsp; · &nbsp;synced now&nbsp; · &nbsp;every 30s</div>
+            <div class="tabs">
+              <span class="active">TO REVIEW&nbsp;&nbsp; 3</span>
+              <span>INVOLVED&nbsp;&nbsp; 8</span>
+              <span>MY PRS&nbsp;&nbsp; 2</span>
+            </div>
+            <div class="queue-label">Needs your review — direct + every team</div>
+            <div class="pr selected">
+              <div><em>›</em> agora/core#412 <mark class="changes">CHANGES REQUESTED</mark></div>
+              <small>@alex · updated 4m ago · via platform/reviewers</small>
+            </div>
+            <div class="pr">
+              <div>&nbsp; agora/web#875 <mark class="approved">APPROVED</mark></div>
+              <small>@mira · updated 11m ago · via @you</small>
+            </div>
+            <div class="pr">
+              <div>&nbsp; stoa/cli#93 <mark class="comments">COMMENTS</mark></div>
+              <small>@theo · updated 28m ago · via platform/reviewers</small>
+            </div>
+            <div class="details">
+              <small>Selected PR details</small>
+              <div><b>agora/core#412</b> <span>[READY]</span></div>
+              <div>Review&nbsp;&nbsp; <strong class="danger">CHANGES REQUESTED</strong></div>
+              <div>Status&nbsp;&nbsp;&nbsp; Mergeable · CI Passing · awaiting 2</div>
+            </div>
+            <div class="shortcuts">↑↓ move&nbsp;&nbsp; Tab views&nbsp;&nbsp; Enter open&nbsp;&nbsp; c copy&nbsp;&nbsp; d details&nbsp;&nbsp; t timer</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="manifesto" aria-label="Product philosophy">
+        <p>
+          Reviews are where momentum waits. Kritikon keeps the obligations visible,
+          the context close, and the terminal quiet.
+        </p>
+      </section>
+
+      <section class="capabilities" id="capabilities" aria-labelledby="capabilities-title">
+        <div class="section-heading">
+          <p class="eyebrow">ONE VIEW OF THE WORK</p>
+          <h2 id="capabilities-title">Nothing open falls through.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <span class="feature-number">01</span>
+            <h3>To review</h3>
+            <p>Direct requests and requests to every visible GitHub team you belong to, kept together and clearly attributed.</p>
+          </article>
+          <article>
+            <span class="feature-number">02</span>
+            <h3>Involved</h3>
+            <p>Open PRs you committed to, reviewed, commented on, were assigned to, or were mentioned in.</p>
+          </article>
+          <article>
+            <span class="feature-number">03</span>
+            <h3>Your PRs</h3>
+            <p>Every open PR you authored—including drafts and PRs with no reviews—alongside the effective review state.</p>
+          </article>
+          <article>
+            <span class="feature-number">04</span>
+            <h3>Every state</h3>
+            <p>Approvals, comments, requested changes, dismissed and pending reviews, review required, and no reviews yet.</p>
+          </article>
+          <article>
+            <span class="feature-number">05</span>
+            <h3>Built for flow</h3>
+            <p>Keyboard and mouse navigation, browser opening, branch copying, background refresh, and stable selection.</p>
+          </article>
+          <article>
+            <span class="feature-number">06</span>
+            <h3>Your GitHub access</h3>
+            <p>Kritikon reuses your authenticated GitHub CLI session. It never reads or stores your token itself.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="install-section" id="install" aria-labelledby="install-title">
+        <div>
+          <p class="eyebrow">START IN SECONDS</p>
+          <h2 id="install-title">Install, authenticate, decide.</h2>
+          <p>Requires the authenticated <a href="https://cli.github.com/">GitHub CLI</a>. Supports Apple Silicon macOS and x86_64 or ARM64 Linux.</p>
+        </div>
+        <div class="install-card">
+          <p>Click to copy</p>
+          <button class="install-command" type="button" data-copy-command aria-label="Copy install command">
+            <code>curl --proto '=https' --tlsv1.2 -LsSf https://storozhenko98.github.io/kritikon/install.sh | bash</code>
+            <span data-copy-label>COPY</span>
+          </button>
+          <p class="install-note">Downloads the correct release, verifies its SHA-256 checksum, and installs without sudo.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="wordmark"><span class="mark" aria-hidden="true">Κ</span><span>KRITIKON</span></div>
+      <p>Named for <i>kritikon</i>: the faculty by which judgments are made.</p>
+      <div class="footer-links">
+        <a href="https://github.com/storozhenko98/kritikon">Source</a>
+        <a href="https://github.com/storozhenko98/kritikon/releases">Releases</a>
+        <a href="https://github.com/storozhenko98/kritikon/blob/main/LICENSE">License</a>
+      </div>
+    </footer>
+
+    <div class="toast" role="status" aria-live="polite" data-toast>Install command copied.</div>
+  </body>
+</html>

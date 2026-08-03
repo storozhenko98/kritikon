@@ -5,11 +5,12 @@ use chrono::{DateTime, Utc};
 #[derive(Debug, Clone)]
 pub struct DashboardData {
     pub viewer: String,
-    pub requested: Vec<PullRequest>,
+    pub review_queue: Vec<PullRequest>,
+    pub involved: Vec<PullRequest>,
     pub owned: Vec<PullRequest>,
     pub warnings: Vec<String>,
     pub fetched_at: DateTime<Utc>,
-    pub team_count: usize,
+    pub teams: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,39 @@ pub struct PullRequest {
     pub labels: Vec<String>,
     pub checks: Option<CheckState>,
     pub requested_via: Vec<String>,
+    pub involvement: Vec<InvolvementReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InvolvementReason {
+    Committed,
+    Reviewed,
+    Commented,
+    Assigned,
+    Mentioned,
+    Participated,
+}
+
+impl InvolvementReason {
+    pub const DISPLAY_ORDER: [Self; 6] = [
+        Self::Committed,
+        Self::Reviewed,
+        Self::Commented,
+        Self::Assigned,
+        Self::Mentioned,
+        Self::Participated,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Committed => "COMMITTED",
+            Self::Reviewed => "REVIEWED",
+            Self::Commented => "COMMENTED",
+            Self::Assigned => "ASSIGNED",
+            Self::Mentioned => "MENTIONED",
+            Self::Participated => "PARTICIPATING",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +261,26 @@ impl DisplayReviewState {
 }
 
 impl PullRequest {
+    pub fn add_involvement(&mut self, reason: InvolvementReason) {
+        if !self.involvement.contains(&reason) {
+            self.involvement.push(reason);
+            self.involvement.sort_by_key(|candidate| {
+                InvolvementReason::DISPLAY_ORDER
+                    .iter()
+                    .position(|ordered| ordered == candidate)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+    }
+
+    pub fn involvement_label(&self) -> String {
+        self.involvement
+            .iter()
+            .map(|reason| reason.label())
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+
     /// Returns one effective state per reviewer. Informational comments do not
     /// overwrite a prior approval/change request from the same reviewer.
     pub fn effective_reviews(&self) -> Vec<Review> {
@@ -348,6 +402,7 @@ mod tests {
             labels: vec![],
             checks: None,
             requested_via: vec![],
+            involvement: vec![],
         }
     }
 
@@ -388,5 +443,24 @@ mod tests {
             let pr = pull_request(vec![review("alice", review_state, 1)]);
             assert_eq!(pr.display_review_state(), display_state);
         }
+    }
+
+    #[test]
+    fn involvement_reasons_are_unique_and_command_center_ordered() {
+        let mut pr = pull_request(vec![]);
+        pr.add_involvement(InvolvementReason::Commented);
+        pr.add_involvement(InvolvementReason::Committed);
+        pr.add_involvement(InvolvementReason::Commented);
+        pr.add_involvement(InvolvementReason::Reviewed);
+
+        assert_eq!(
+            pr.involvement,
+            vec![
+                InvolvementReason::Committed,
+                InvolvementReason::Reviewed,
+                InvolvementReason::Commented,
+            ]
+        );
+        assert_eq!(pr.involvement_label(), "COMMITTED + REVIEWED + COMMENTED");
     }
 }
