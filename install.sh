@@ -80,7 +80,7 @@ fi
 
 [ "$actual" = "$expected" ] || fail "download checksum verification failed"
 
-tar -xzf "$temp_dir/$archive" -C "$temp_dir"
+LC_ALL=C tar -xzf "$temp_dir/$archive" -C "$temp_dir"
 [ -f "$temp_dir/kritikon" ] || fail "release archive does not contain the kritikon binary"
 
 mkdir -p "$install_dir"
