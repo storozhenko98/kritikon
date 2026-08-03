@@ -33,7 +33,7 @@ The installer selects the native binary, verifies its SHA-256 checksum, and plac
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://storozhenko98.github.io/kritikon/install.sh -o install-kritikon.sh
-KRITIKON_INSTALL_DIR="$HOME/bin" KRITIKON_VERSION=0.3.0 sh install-kritikon.sh
+KRITIKON_INSTALL_DIR="$HOME/bin" KRITIKON_VERSION=0.3.1 sh install-kritikon.sh
 rm install-kritikon.sh
 ```
 
