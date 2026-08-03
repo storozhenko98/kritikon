@@ -841,7 +841,7 @@ fn merge_commit_involvement(
         }
     }
     data.involved
-        .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        .sort_by_key(|pull_request| std::cmp::Reverse(pull_request.updated_at));
     for warning in warnings {
         if !data.warnings.contains(warning) {
             data.warnings.push(warning.clone());

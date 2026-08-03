@@ -29,7 +29,7 @@ jobs:
             archive: kritikon-linux-aarch64.tar.gz
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup set profile minimal
@@ -51,7 +51,7 @@ jobs:
           mkdir package
           cp "target/${{ matrix.target }}/release/kritikon" README.md LICENSE package/
           tar -czf "${{ matrix.archive }}" -C package .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
@@ -64,7 +64,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

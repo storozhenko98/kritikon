@@ -173,9 +173,9 @@ pub fn fetch_dashboard() -> Result<DashboardData> {
 
     involved.retain(|pull_request| !pull_request.author.eq_ignore_ascii_case(&viewer));
     deduplicate_pull_requests(&mut involved);
-    owned.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    review_queue.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    involved.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    owned.sort_by_key(|pull_request| std::cmp::Reverse(pull_request.updated_at));
+    review_queue.sort_by_key(|pull_request| std::cmp::Reverse(pull_request.updated_at));
+    involved.sort_by_key(|pull_request| std::cmp::Reverse(pull_request.updated_at));
 
     let mut team_names = teams
         .iter()
@@ -207,7 +207,7 @@ pub fn fetch_commit_involvement(viewer: &str) -> Result<CommitInvolvement> {
         pull_request.add_involvement(InvolvementReason::Committed);
     }
     deduplicate_pull_requests(&mut pull_requests);
-    pull_requests.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    pull_requests.sort_by_key(|pull_request| std::cmp::Reverse(pull_request.updated_at));
     Ok(CommitInvolvement { pull_requests })
 }
 
@@ -219,7 +219,7 @@ pub fn fetch_complete_dashboard() -> Result<DashboardData> {
             deduplicate_pull_requests(&mut dashboard.involved);
             dashboard
                 .involved
-                .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                .sort_by_key(|pull_request| std::cmp::Reverse(pull_request.updated_at));
         }
         Err(error) => dashboard.warnings.push(format!(
             "Commit-based involvement is temporarily unavailable ({error:#})"
