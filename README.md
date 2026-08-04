@@ -33,7 +33,7 @@ The installer selects the native binary, verifies its SHA-256 checksum, and plac
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://storozhenko98.github.io/kritikon/install.sh -o install-kritikon.sh
-KRITIKON_INSTALL_DIR="$HOME/bin" KRITIKON_VERSION=0.3.1 sh install-kritikon.sh
+KRITIKON_INSTALL_DIR="$HOME/bin" KRITIKON_VERSION=0.3.2 sh install-kritikon.sh
 rm install-kritikon.sh
 ```
 
@@ -138,9 +138,11 @@ Outstanding direct and team requests are shown separately from submitted reviews
 
 All GitHub work runs in the background. During refresh, the current dashboard stays visible and interactive. Selection is anchored by PR URL and visible screen row, so reordered results do not move focus to another PR. Repeated refresh requests are coalesced instead of launching parallel fetches.
 
+Frequent refreshes query only a lightweight index of open PR IDs and update timestamps. Full comments, reviews, requests, labels, commit authors, and file statistics are cached and fetched once for new or changed PRs; a compact batched status query keeps CI, mergeability, and GitHub's review decision current. Unchanged details are reconciled every 30 minutes when the API budget permits. Every GraphQL operation records its actual remaining budget, skips optional reconciliation below 500 points, and pauses polling below 50 points until GitHub's reported reset while leaving the last complete dashboard on screen.
+
 The **Involved** queue combines GitHub participation search, submitted reviews, and commit-to-PR associations. Each row explains why it appears: `COMMITTED`, `REVIEWED`, `COMMENTED`, `ASSIGNED`, `MENTIONED`, or `PARTICIPATING`.
 
-Commit-only discovery follows associations for the newest 1,000 commits exposed by GitHub Search and caches that index for five minutes. GitHub Search itself exposes at most 1,000 results per query. Kritikon paginates to that limit and warns when a queue exceeds it.
+Commit-only discovery follows associations for the newest 1,000 commits exposed by GitHub Search. After the initial background index, Kritikon checks only the newest commit page every 30 minutes and associates newly seen commits; it reconciles the complete 1,000-commit window every six hours. GitHub Search itself exposes at most 1,000 results per query. Kritikon paginates normal PR searches to that limit and warns when a queue exceeds it.
 
 Private PR visibility exactly matches the active `gh` authentication. Team discovery uses GitHub's authenticated-user teams endpoint; if teams cannot be listed, Kritikon warns without blocking other queues.
 

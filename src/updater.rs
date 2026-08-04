@@ -202,5 +202,6 @@ mod tests {
         let installer = String::from_utf8_lossy(INSTALLER);
         assert!(installer.contains("SHA256SUMS"));
         assert!(installer.contains("checksum verification failed"));
+        assert!(installer.contains("LC_ALL=C shasum -a 256"));
     }
 }
