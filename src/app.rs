@@ -63,6 +63,7 @@ pub enum Action {
     Refresh,
     Open(String),
     CopyBranch(String),
+    CopyUrl(String),
     SaveConfig(Config),
     ResetConfig,
 }
@@ -522,7 +523,9 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+        {
             return Action::Quit;
         }
         if self.config_editor.is_some() {
@@ -586,6 +589,14 @@ impl App {
                 self.open_config(None);
                 Action::None
             }
+            KeyCode::Char('C') => self
+                .selected_url()
+                .map(Action::CopyUrl)
+                .unwrap_or(Action::None),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::SHIFT) => self
+                .selected_url()
+                .map(Action::CopyUrl)
+                .unwrap_or(Action::None),
             KeyCode::Char('c') => self
                 .selected_branch()
                 .map(Action::CopyBranch)
@@ -946,6 +957,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn shifted_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
     #[test]
     fn keyboard_navigation_switches_tabs_scrolls_and_opens() {
         let mut app = app();
@@ -1078,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_and_timer_shortcuts_are_unambiguous() {
+    fn branch_url_and_timer_shortcuts_are_unambiguous() {
         let mut app = app();
 
         assert_eq!(
@@ -1087,8 +1102,34 @@ mod tests {
         );
         assert!(app.config_editor.is_none());
 
+        assert_eq!(
+            app.handle_key(shifted_key(KeyCode::Char('C'))),
+            Action::CopyUrl("https://github.com/acme/app/pull/1".into())
+        );
+        assert_eq!(
+            app.handle_key(shifted_key(KeyCode::Char('c'))),
+            Action::CopyUrl("https://github.com/acme/app/pull/1".into())
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('C'))),
+            Action::CopyUrl("https://github.com/acme/app/pull/1".into())
+        );
+
         assert_eq!(app.handle_key(key(KeyCode::Char('t'))), Action::None);
         assert!(app.config_editor.is_some());
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_with_uppercase_terminal_input() {
+        let mut app = app();
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Action::Quit
+        );
     }
 
     #[test]
