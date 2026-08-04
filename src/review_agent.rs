@@ -53,8 +53,15 @@ impl From<&PullRequest> for ReviewTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
-    Review,
+    Review(ReviewRunKind),
     Chat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRunKind {
+    ReReview,
+    FollowUp,
+    NewSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +196,7 @@ impl ReviewCoordinator {
     pub fn start_review(
         &mut self,
         target: ReviewTarget,
+        kind: ReviewRunKind,
         focus: Option<String>,
     ) -> Result<ReviewSnapshot> {
         if self.active.contains_key(&target.url) {
@@ -196,8 +204,25 @@ impl ReviewCoordinator {
         }
 
         let mut initial = self.store.inspect(target.clone())?;
-        self.store.clear_draft_outputs(&target)?;
-        initial.draft = None;
+        match kind {
+            ReviewRunKind::ReReview => {
+                self.store.clear_draft_outputs(&target)?;
+                initial.draft = None;
+            }
+            ReviewRunKind::FollowUp => {
+                if !initial.has_session() || !initial.has_draft() {
+                    bail!("a follow-up requires both a saved OpenCode session and review draft");
+                }
+                if focus.as_deref().is_none_or(|focus| focus.trim().is_empty()) {
+                    bail!("a follow-up requires instructions describing what to revisit");
+                }
+            }
+            ReviewRunKind::NewSession => {
+                self.store.reset_review(&target)?;
+                initial.session_id = None;
+                initial.draft = None;
+            }
+        }
         let control = Arc::new(JobControl::default());
         self.active.insert(target.url.clone(), control.clone());
 
@@ -209,6 +234,7 @@ impl ReviewCoordinator {
             let result = run_review_job(ReviewJob {
                 store: &store,
                 target: target.clone(),
+                kind,
                 focus: focus.as_deref(),
                 dependencies: &dependencies,
                 control: &control,
@@ -438,7 +464,22 @@ impl ReviewStore {
     fn clear_draft_outputs(&self, target: &ReviewTarget) -> Result<()> {
         let paths = self.paths(target);
         remove_optional_file(&paths.draft)?;
-        remove_optional_file(&workspace_draft_path(&paths.workspace))
+        remove_optional_file(&workspace_draft_path(&paths.workspace))?;
+        remove_optional_file(&workspace_previous_draft_path(&paths.workspace))
+    }
+
+    fn reset_review(&self, target: &ReviewTarget) -> Result<()> {
+        let paths = self.paths(target);
+        self.clear_draft_outputs(target)?;
+        remove_optional_file(&paths.record)
+    }
+
+    fn save_new_draft(&self, source: &Path, destination: &Path) -> Result<Option<String>> {
+        let Some(draft) = read_optional_nonempty(source)? else {
+            return Ok(None);
+        };
+        atomic_write_private(destination, draft.as_bytes())?;
+        Ok(Some(draft))
     }
 }
 
@@ -456,6 +497,7 @@ pub fn inspect(target: ReviewTarget) -> Result<ReviewSnapshot> {
 struct ReviewJob<'a> {
     store: &'a ReviewStore,
     target: ReviewTarget,
+    kind: ReviewRunKind,
     focus: Option<&'a str>,
     dependencies: &'a ReviewDependencies,
     control: &'a Arc<JobControl>,
@@ -466,6 +508,7 @@ fn run_review_job(job: ReviewJob<'_>) -> Result<ReviewSnapshot> {
     let ReviewJob {
         store,
         target,
+        kind,
         focus,
         dependencies,
         control,
@@ -476,6 +519,7 @@ fn run_review_job(job: ReviewJob<'_>) -> Result<ReviewSnapshot> {
         bail!("review stopped before workspace preparation began");
     }
     prepare_workspace(&snapshot, &dependencies.gh)?;
+    prepare_review_output(&snapshot, kind)?;
     let capabilities = verify_opencode(&dependencies.opencode)?;
     let permission_config = opencode_permission_config()?;
     let paths = store.paths(&target);
@@ -515,6 +559,7 @@ fn run_review_job(job: ReviewJob<'_>) -> Result<ReviewSnapshot> {
             permission_config: &permission_config,
             capabilities: &capabilities,
             model: dependencies.model.as_deref(),
+            kind,
             focus: focus.unwrap_or_default(),
         },
         control,
@@ -523,7 +568,19 @@ fn run_review_job(job: ReviewJob<'_>) -> Result<ReviewSnapshot> {
     wait_for_attachments(control)?;
 
     let workspace_draft = workspace_draft_path(&snapshot.workspace);
-    let draft = store.save_draft(&workspace_draft, &paths.draft)?;
+    let replacement = store.save_new_draft(&workspace_draft, &paths.draft)?;
+    remove_optional_file(&workspace_previous_draft_path(&snapshot.workspace))?;
+    if kind == ReviewRunKind::FollowUp && replacement.is_none() {
+        if status.success() {
+            bail!(
+                "OpenCode follow-up finished without saving a replacement .kritikon/review.md; the previous draft was preserved"
+            );
+        }
+        bail!(
+            "OpenCode follow-up exited with {status} without saving a replacement .kritikon/review.md; the previous draft was preserved"
+        );
+    }
+    let draft = replacement;
     store.save_record(
         &paths.record,
         &ReviewRecord {
@@ -577,6 +634,7 @@ struct HeadlessReview<'a> {
     permission_config: &'a str,
     capabilities: &'a OpencodeCapabilities,
     model: Option<&'a str>,
+    kind: ReviewRunKind,
     focus: &'a str,
 }
 
@@ -589,6 +647,7 @@ fn run_headless_review(request: HeadlessReview<'_>, control: &JobControl) -> Res
         permission_config,
         capabilities,
         model,
+        kind,
         focus,
     } = request;
     let log = open_private_log(log_path, true)?;
@@ -612,7 +671,7 @@ fn run_headless_review(request: HeadlessReview<'_>, control: &JobControl) -> Res
         command.args(["--model", model]);
     }
     command
-        .arg(review_prompt(&snapshot.target, focus))
+        .arg(review_prompt(&snapshot.target, kind, focus))
         .env("OPENCODE_SERVER_PASSWORD", &connection.password)
         .env("OPENCODE_CONFIG_CONTENT", permission_config)
         .stdin(Stdio::null())
@@ -754,6 +813,21 @@ fn prepare_workspace(snapshot: &ReviewSnapshot, gh: &Path) -> Result<()> {
             workspace.display()
         )
     })?;
+    Ok(())
+}
+
+fn prepare_review_output(snapshot: &ReviewSnapshot, kind: ReviewRunKind) -> Result<()> {
+    let output = workspace_draft_path(&snapshot.workspace);
+    remove_optional_file(&output)?;
+    let previous = workspace_previous_draft_path(&snapshot.workspace);
+    remove_optional_file(&previous)?;
+    if kind == ReviewRunKind::FollowUp {
+        let draft = snapshot
+            .draft
+            .as_deref()
+            .context("a follow-up requires a saved review draft")?;
+        atomic_write_private(&previous, draft.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -1077,8 +1151,17 @@ fn workspace_draft_path(workspace: &Path) -> PathBuf {
     workspace.join(".kritikon").join("review.md")
 }
 
-fn review_prompt(target: &ReviewTarget, focus: &str) -> String {
-    let focus = if focus.trim().is_empty() {
+fn workspace_previous_draft_path(workspace: &Path) -> PathBuf {
+    workspace.join(".kritikon").join("previous-review.md")
+}
+
+fn review_prompt(target: &ReviewTarget, kind: ReviewRunKind, focus: &str) -> String {
+    let task = if kind == ReviewRunKind::FollowUp {
+        format!(
+            "This is a follow-up on the existing proposed review stored at `.kritikon/previous-review.md`. Read that complete draft, revisit the code and evidence needed to address the user's follow-up below, and produce a complete revised review. Preserve still-valid findings; correct, remove, or expand them only when the evidence supports it.\n\nUser follow-up:\n{}",
+            focus.trim()
+        )
+    } else if focus.trim().is_empty() {
         "Apply a thorough, evidence-based review. Prioritize correctness, regressions, security, data loss, concurrency, and missing tests.".into()
     } else {
         format!("Additional reviewer focus:\n{}", focus.trim())
@@ -1088,7 +1171,7 @@ fn review_prompt(target: &ReviewTarget, focus: &str) -> String {
 
 You are in a managed detached checkout of the PR head ({head}) for {repository}. Compare it to origin/{base}. Read repository instructions and inspect the actual diff, relevant surrounding code, and tests. Run focused checks when useful.
 
-{focus}
+{task}
 
 This is a review-only workspace. Do not edit product files, commit, push, submit a GitHub review, or call `gh pr review`. You may use read-only tools and test commands. Kritikon will handle submission only after the user previews and confirms the draft.
 
@@ -1313,7 +1396,11 @@ mod tests {
 
     #[test]
     fn prompt_requires_a_saved_draft_and_forbids_direct_submission() {
-        let prompt = review_prompt(&target(), "Focus on race conditions.");
+        let prompt = review_prompt(
+            &target(),
+            ReviewRunKind::ReReview,
+            "Focus on race conditions.",
+        );
         assert!(prompt.contains(".kritikon/review.md"));
         assert!(prompt.contains("Focus on race conditions."));
         assert!(prompt.contains("Do not edit product files"));
@@ -1321,6 +1408,67 @@ mod tests {
         assert!(prompt.contains("APPROVE"));
         assert!(prompt.contains("COMMENT"));
         assert!(prompt.contains("REQUEST_CHANGES"));
+    }
+
+    #[test]
+    fn follow_up_prompt_revises_the_previous_review_instead_of_starting_over() {
+        let prompt = review_prompt(
+            &target(),
+            ReviewRunKind::FollowUp,
+            "Verify whether the cancellation finding is still valid.",
+        );
+        assert!(prompt.contains(".kritikon/previous-review.md"));
+        assert!(prompt.contains("existing proposed review"));
+        assert!(prompt.contains("Preserve still-valid findings"));
+        assert!(prompt.contains("Verify whether the cancellation finding is still valid."));
+        assert!(prompt.contains("complete revised review"));
+        assert!(prompt.contains(".kritikon/review.md"));
+    }
+
+    #[test]
+    fn follow_up_requires_a_session_draft_and_nonempty_instruction_without_mutating_them() {
+        let data = tempdir().unwrap();
+        let workspaces = tempdir().unwrap();
+        let binaries = tempdir().unwrap();
+        let store = ReviewStore::at(data.path(), workspaces.path());
+        let target = target();
+        let paths = store.paths(&target);
+        let mut coordinator = ReviewCoordinator::at(
+            store.clone(),
+            binaries.path().join("gh"),
+            binaries.path().join("opencode"),
+            None,
+        );
+
+        let error = coordinator
+            .start_review(
+                target.clone(),
+                ReviewRunKind::FollowUp,
+                Some("recheck this".into()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("saved OpenCode session"));
+
+        atomic_write_private(&paths.draft, b"# Review\n\nKeep me.\n").unwrap();
+        store
+            .save_record(
+                &paths.record,
+                &ReviewRecord {
+                    version: RECORD_VERSION,
+                    target: target.clone(),
+                    session_id: "ses_existing".into(),
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+        let error = coordinator
+            .start_review(target.clone(), ReviewRunKind::FollowUp, Some("   ".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("requires instructions"));
+
+        let snapshot = store.inspect(target).unwrap();
+        assert_eq!(snapshot.session_id.as_deref(), Some("ses_existing"));
+        assert_eq!(snapshot.draft.as_deref(), Some("# Review\n\nKeep me.\n"));
     }
 
     #[test]
@@ -1385,6 +1533,87 @@ mod tests {
         assert!(!snapshot.has_draft());
         assert!(!paths.draft.exists());
         assert!(!workspace_draft_path(&paths.workspace).exists());
+    }
+
+    #[test]
+    fn follow_up_keeps_the_saved_draft_until_a_nonempty_replacement_exists() {
+        let data = tempdir().unwrap();
+        let workspaces = tempdir().unwrap();
+        let store = ReviewStore::at(data.path(), workspaces.path());
+        let target = target();
+        let paths = store.paths(&target);
+        atomic_write_private(&paths.draft, b"# Previous review\n\nKeep this safe.\n").unwrap();
+        let snapshot = store.inspect(target).unwrap();
+
+        prepare_review_output(&snapshot, ReviewRunKind::FollowUp).unwrap();
+
+        assert!(!workspace_draft_path(&paths.workspace).exists());
+        assert_eq!(
+            fs::read_to_string(workspace_previous_draft_path(&paths.workspace)).unwrap(),
+            "# Previous review\n\nKeep this safe.\n"
+        );
+        assert_eq!(
+            store
+                .save_new_draft(&workspace_draft_path(&paths.workspace), &paths.draft)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.draft).unwrap(),
+            "# Previous review\n\nKeep this safe.\n"
+        );
+
+        atomic_write_private(
+            &workspace_draft_path(&paths.workspace),
+            b"# Revised review\n\nReplacement is complete.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .save_new_draft(&workspace_draft_path(&paths.workspace), &paths.draft)
+                .unwrap()
+                .as_deref(),
+            Some("# Revised review\n\nReplacement is complete.\n")
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.draft).unwrap(),
+            "# Revised review\n\nReplacement is complete.\n"
+        );
+    }
+
+    #[test]
+    fn new_session_reset_clears_session_and_drafts() {
+        let data = tempdir().unwrap();
+        let workspaces = tempdir().unwrap();
+        let store = ReviewStore::at(data.path(), workspaces.path());
+        let target = target();
+        let paths = store.paths(&target);
+        atomic_write_private(&paths.draft, b"# Saved review\n").unwrap();
+        atomic_write_private(
+            &workspace_previous_draft_path(&paths.workspace),
+            b"# Previous review\n",
+        )
+        .unwrap();
+        store
+            .save_record(
+                &paths.record,
+                &ReviewRecord {
+                    version: RECORD_VERSION,
+                    target: target.clone(),
+                    session_id: "ses_old".into(),
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+
+        store.reset_review(&target).unwrap();
+
+        let snapshot = store.inspect(target).unwrap();
+        assert!(!snapshot.has_session());
+        assert!(!snapshot.has_draft());
+        assert!(!paths.record.exists());
+        assert!(!paths.draft.exists());
+        assert!(!workspace_previous_draft_path(&paths.workspace).exists());
     }
 
     #[test]
@@ -1522,6 +1751,7 @@ mod tests {
                     run_auto_flag: true,
                 },
                 model: Some("opencode/gpt-5.4"),
+                kind: ReviewRunKind::ReReview,
                 focus: "Check detachment.",
             },
             &JobControl::default(),
@@ -1697,7 +1927,9 @@ printf '%s' "$OPENCODE_SERVER_PASSWORD" > '{}'
         );
 
         let started = Instant::now();
-        let snapshot = coordinator.start_review(target(), None).unwrap();
+        let snapshot = coordinator
+            .start_review(target(), ReviewRunKind::ReReview, None)
+            .unwrap();
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(!snapshot.has_session());
 

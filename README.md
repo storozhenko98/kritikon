@@ -14,7 +14,7 @@ It keeps the three queues that matter in one calm interface:
 2. **Involved** — open PRs you committed to, reviewed, commented on, were assigned to, or were mentioned in.
 3. **My PRs** — every open PR you authored, including drafts and PRs with no reviews.
 
-When you want a second set of eyes, `Shift+R` can optionally start a PR-scoped OpenCode review. It runs headlessly in the background while Kritikon stays fully usable, preserves one resumable session per PR, lets you attach or detach the real OpenCode TUI, and renders the resulting Markdown for your review before Kritikon can post anything. OpenCode is not required for the normal dashboard.
+When you want a second set of eyes, `Shift+R` can optionally start a PR-scoped OpenCode review. It runs headlessly in the background while Kritikon stays fully usable, preserves one resumable session per PR, lets you attach or detach the real OpenCode TUI, and renders the resulting Markdown for your review before Kritikon can post anything. Follow-ups revise the last good draft without discarding it while the agent works. OpenCode is not required for the normal dashboard.
 
 The list stays compact while the selected PR shows its full review breakdown, outstanding reviewers, draft/ready state, mergeability, CI rollup, branches, files, line changes, comments, labels, and timestamps. Closed PRs are never queried.
 
@@ -102,18 +102,19 @@ On a PR with no saved agent session:
 3. Press `Enter`. Kritikon immediately queues the work in the background and remains responsive while it prepares the managed scratch checkout and runs OpenCode headlessly.
 4. Press `Esc` to use the rest of the dashboard while the review runs. The footer keeps the background-job count visible and marks completed drafts as ready.
 5. Press `Shift+R` on that PR to inspect progress. Once its session is ready, press `o` to attach the real OpenCode TUI if you want to watch or intervene. In OpenCode, press `Ctrl+X`, then `Q` (or run `/exit`) to detach the client and return to Kritikon without stopping the background worker.
-6. OpenCode writes the proposed review body to `.kritikon/review.md` without posting anything. Kritikon smoothly replaces the progress view with the rendered Markdown draft when the worker completes. If OpenCode finishes without writing a non-empty file, the PR is marked `AGENT SESSION` instead of falsely claiming that a draft is ready; the session remains available to inspect or rerun.
+6. OpenCode writes the proposed review body to `.kritikon/review.md` without posting anything. Kritikon smoothly replaces the progress view with the rendered Markdown draft when the worker completes. If an initial review or clean re-review finishes without a non-empty file, the PR is marked `AGENT SESSION` instead of falsely claiming that a draft is ready. If a follow-up produces no replacement, Kritikon keeps the previous draft and explains what happened.
 
 Every review panel and background job is keyed to the exact PR URL. Dashboard rows show a compact `AGENT PREP`, `AGENT RUNNING`, `AGENT READY`, `AGENT DRAFT`, `AGENT SESSION`, or `AGENT FAILED` badge for that PR, and unfinished prompts, failures, sessions, and drafts remain independent when you move between PRs.
 
 The draft view supports:
 
-- `r` — run the standard review prompt again in the same OpenCode session.
-- `e` — add custom focus and continue the same session.
+- `f` — follow up on the rendered review in the same OpenCode session. Enter the question or concern to revisit; Kritikon keeps the current draft visible and replaces it only after OpenCode produces a new non-empty review. `e` remains an alias for this flow.
+- `r` — re-review from scratch in the same OpenCode session. This intentionally clears the current draft but retains the conversation context.
+- `n` — start a completely new session and clean review. Because this forgets both Kritikon's current session link and saved draft, it requires a separate confirmation.
 - `o` — attach the full OpenCode TUI to a running review, or reopen the saved chat after completion, without automatically sending another review prompt.
 - `p` — choose **Approve**, **Comment**, or **Request changes**, then pass a separate confirmation screen before Kritikon invokes `gh pr review`.
 
-OpenCode context is preserved by session ID per PR. Reopening the same PR—even after a later review request—continues the prior conversation. Before each run, Kritikon refreshes its disposable checkout to the latest PR head and clears the prior draft artifact so only Markdown produced by the new run can become `AGENT READY`. Active reviews use a password-protected OpenCode server bound only to `127.0.0.1`; the headless worker and optional TUI are separate clients of that server, which is why detaching the TUI does not interrupt the review.
+OpenCode context is preserved by session ID per PR. Reopening the same PR—even after a later review request—continues the prior conversation. Before every run, Kritikon refreshes its disposable checkout to the latest PR head. A clean re-review clears the prior draft artifact; a follow-up supplies that draft as revision context and preserves the saved copy until a valid replacement exists. Active reviews use a password-protected OpenCode server bound only to `127.0.0.1`; the headless worker and optional TUI are separate clients of that server, which is why detaching the TUI does not interrupt the review.
 
 Session records and drafts use native data directories:
 

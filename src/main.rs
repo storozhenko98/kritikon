@@ -247,16 +247,22 @@ fn run_tui(
                     #[cfg(debug_assertions)]
                     if source != DataSource::Github {
                         match mode {
-                            review_agent::LaunchMode::Review => {
+                            review_agent::LaunchMode::Review(kind) => {
                                 let mut preparing =
                                     review_agent::development_snapshot(target.clone());
-                                preparing.session_id = None;
-                                preparing.draft = None;
+                                if kind != review_agent::ReviewRunKind::FollowUp {
+                                    preparing.draft = None;
+                                }
+                                if kind == review_agent::ReviewRunKind::NewSession {
+                                    preparing.session_id = None;
+                                }
                                 app.review_started(preparing);
 
                                 let mut running =
                                     review_agent::development_snapshot(target.clone());
-                                running.draft = None;
+                                if kind != review_agent::ReviewRunKind::FollowUp {
+                                    running.draft = None;
+                                }
                                 let mut completed = review_agent::development_snapshot(target);
                                 if let Some(focus) = focus {
                                     completed.warning = Some(format!(
@@ -284,8 +290,8 @@ fn run_tui(
                     }
 
                     match mode {
-                        review_agent::LaunchMode::Review => {
-                            match review_coordinator.start_review(target.clone(), focus) {
+                        review_agent::LaunchMode::Review(kind) => {
+                            match review_coordinator.start_review(target.clone(), kind, focus) {
                                 Ok(snapshot) => app.review_started(snapshot),
                                 Err(error) => {
                                     app.show_review_error(target, format!("{error:#}"));

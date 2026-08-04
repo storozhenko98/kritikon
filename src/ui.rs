@@ -940,6 +940,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     };
     let mode = panel.mode;
     let snapshot = panel.snapshot.clone();
+    let run_kind = panel.run_kind;
     let input = panel.input.clone();
     let error = panel.error.clone();
     let scroll = panel.scroll;
@@ -996,31 +997,66 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 ])
                 .split(inner);
             frame.render_widget(Paragraph::new(header), chunks[0]);
-            frame.render_widget(
-                Paragraph::new(vec![
+            let prompt_lines = if run_kind == crate::review_agent::ReviewRunKind::FollowUp {
+                vec![
                     Line::from(Span::styled(
-                        "Default review template",
+                        "Follow up on the saved review",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(
+                        "The current Markdown stays visible and safe while OpenCode revisits it in the same PR session.",
+                    ),
+                    Line::raw(
+                        "A new non-empty review replaces it only after the follow-up completes successfully.",
+                    ),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        error.unwrap_or_else(|| {
+                            "Describe the question, concern, or area OpenCode should revisit".into()
+                        }),
+                        Style::default().fg(if panel.error.is_some() {
+                            Color::Red
+                        } else {
+                            MUTED
+                        }),
+                    )),
+                ]
+            } else {
+                vec![
+                    Line::from(Span::styled(
+                        "Default review template · fresh draft in the current session",
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     )),
                     Line::raw(
                         "Review the actual diff for correctness, regressions, security, data loss, concurrency, and missing tests.",
                     ),
                     Line::raw(
-                        "OpenCode runs headlessly with permission auto-approval in a managed scratch checkout. Kritikon remains usable while it works.",
+                        "OpenCode runs headlessly with permission auto-approval in a managed scratch checkout while Kritikon remains usable.",
                     ),
                     Line::raw(
-                        "It must save the proposed review to .kritikon/review.md. Kritikon preserves the session for later chat and re-review.",
+                        "The previous draft is replaced only by Markdown produced by this new review run.",
                     ),
                     Line::raw(""),
                     Line::from(Span::styled(
-                        "Optional focus — type below, or leave blank for the template",
+                        "Optional focus — type below, or leave blank for the complete template",
                         Style::default().fg(MUTED),
                     )),
-                ])
-                .wrap(Wrap { trim: true }),
+                ]
+            };
+            frame.render_widget(
+                Paragraph::new(prompt_lines).wrap(Wrap { trim: true }),
                 chunks[1],
             );
-            render_review_focus_editor(frame, chunks[2], &input);
+            let (editor_title, placeholder) =
+                if run_kind == crate::review_agent::ReviewRunKind::FollowUp {
+                    ("Follow-up instructions", "Describe what to revisit…")
+                } else {
+                    (
+                        "Focus instructions",
+                        "Add optional guidance for this review…",
+                    )
+                };
+            render_review_focus_editor(frame, chunks[2], &input, editor_title, placeholder);
         }
         ReviewPanelMode::Running(phase) => {
             let (status, detail, color) = match phase {
@@ -1035,39 +1071,65 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     ACCENT,
                 ),
             };
-            frame.render_widget(
-                Paragraph::new([
-                    header,
-                    vec![
-                        Line::raw(""),
-                        Line::from(Span::styled(
-                            status,
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        )),
-                        Line::raw(""),
-                        Line::from(detail),
-                        Line::raw(""),
-                        Line::from(Span::styled(
-                            "Kritikon is not blocked. Press Esc to return to the dashboard; the review keeps running.",
-                            Style::default().fg(Color::Green),
-                        )),
-                        Line::raw(""),
-                        if phase == ReviewRunPhase::Reviewing {
-                            Line::from(Span::styled(
-                                "o  attach OpenCode · there, Ctrl+X then Q or /exit detaches back here · Esc  dashboard",
-                                Style::default().fg(MUTED),
-                            ))
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .split(inner);
+            let mut lines = [
+                header,
+                vec![
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        if snapshot.has_draft() {
+                            format!("FOLLOW-UP {status}")
                         } else {
-                            Line::from(Span::styled(
-                                "The attach option appears as soon as the resumable session is ready · Esc  dashboard",
-                                Style::default().fg(MUTED),
-                            ))
+                            status.into()
                         },
-                    ],
-                ]
-                .concat())
-                .wrap(Wrap { trim: true }),
-                inner,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(""),
+                    Line::from(detail),
+                    Line::from(Span::styled(
+                        "Kritikon is not blocked; Esc returns to the dashboard while this keeps running.",
+                        Style::default().fg(Color::Green),
+                    )),
+                ],
+            ]
+            .concat();
+            if let Some(draft) = snapshot.draft.as_deref() {
+                lines.extend(
+                    [
+                        vec![
+                            Line::raw(""),
+                            Line::from(Span::styled(
+                                "Previous draft — preserved until a valid replacement is ready",
+                                Style::default()
+                                    .fg(Color::Blue)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            Line::raw(""),
+                        ],
+                        markdown_lines(draft),
+                    ]
+                    .concat(),
+                );
+            }
+            let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+            let line_count = paragraph.line_count(chunks[0].width) as u16;
+            let max_scroll = line_count.saturating_sub(chunks[0].height);
+            if let Some(panel) = &mut app.review_panel {
+                panel.max_scroll = max_scroll;
+                panel.scroll = panel.scroll.min(max_scroll);
+            }
+            frame.render_widget(paragraph.scroll((scroll.min(max_scroll), 0)), chunks[0]);
+            let controls = if phase == ReviewRunPhase::Reviewing {
+                "↑↓/jk scroll  ·  o attach OpenCode  ·  Ctrl+X then Q or /exit detaches  ·  Esc dashboard"
+            } else {
+                "↑↓/jk scroll  ·  attach becomes available when the session is ready  ·  Esc dashboard"
+            };
+            frame.render_widget(
+                Paragraph::new(controls).style(Style::default().fg(MUTED)),
+                chunks[1],
             );
         }
         ReviewPanelMode::Draft => {
@@ -1091,7 +1153,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         Style::default().fg(Color::Yellow),
                     ))]
                 });
-            if let Some(warning) = snapshot.warning {
+            if let Some(warning) = snapshot.warning.as_deref() {
                 lines.insert(
                     0,
                     Line::from(Span::styled(
@@ -1109,17 +1171,56 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 panel.scroll = panel.scroll.min(max_scroll);
             }
             frame.render_widget(paragraph.scroll((scroll.min(max_scroll), 0)), chunks[1]);
-            let controls = if has_draft {
-                "↑↓/jk scroll  ·  r re-review  ·  e custom focus  ·  o optional OpenCode chat  ·  p post  ·  Esc close"
+            let controls = if has_draft && snapshot.has_session() && chunks[2].width < 96 {
+                vec![
+                    Line::raw("f follow up  ·  r re-review  ·  n new session"),
+                    Line::raw("o chat  ·  p post  ·  Esc close  ·  ↑↓/jk scroll"),
+                ]
+            } else if has_draft && snapshot.has_session() {
+                vec![Line::raw(
+                    "↑↓/jk scroll  ·  f follow up  ·  r re-review  ·  n new session  ·  o chat  ·  p post  ·  Esc close",
+                )]
+            } else if has_draft {
+                vec![Line::raw(
+                    "↑↓/jk scroll  ·  r new review  ·  e custom focus  ·  p post  ·  Esc close",
+                )]
             } else {
-                "↑↓/jk scroll  ·  r rerun  ·  e custom focus  ·  o resume OpenCode chat  ·  Esc close"
+                vec![Line::raw(
+                    "↑↓/jk scroll  ·  r rerun  ·  e custom focus  ·  n new session  ·  o resume chat  ·  Esc close",
+                )]
             };
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    controls,
-                    Style::default().fg(MUTED),
-                ))),
+                Paragraph::new(controls).style(Style::default().fg(MUTED)),
                 chunks[2],
+            );
+        }
+        ReviewPanelMode::ConfirmNewSession => {
+            frame.render_widget(
+                Paragraph::new([
+                    header,
+                    vec![
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Start a completely new OpenCode session?",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::raw(""),
+                        Line::raw(
+                            "This forgets Kritikon's link to the current OpenCode conversation and clears the saved draft.",
+                        ),
+                        Line::raw(
+                            "Use re-review instead if you want a clean draft while keeping the current session context.",
+                        ),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "y / Enter  start new session  ·  n / Esc  keep current session and draft",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        )),
+                    ],
+                ]
+                .concat())
+                .wrap(Wrap { trim: true }),
+                inner,
             );
         }
         ReviewPanelMode::PostChoice => {
@@ -1237,7 +1338,13 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
-fn render_review_focus_editor(frame: &mut Frame<'_>, area: Rect, input: &str) {
+fn render_review_focus_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input: &str,
+    base_title: &str,
+    placeholder: &str,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1259,7 +1366,7 @@ fn render_review_focus_editor(frame: &mut Frame<'_>, area: Rect, input: &str) {
         Line::from(vec![
             Span::styled("▌", Style::default().fg(ACCENT)),
             Span::styled(
-                " Add optional guidance for this review…",
+                format!(" {placeholder}"),
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -1275,13 +1382,13 @@ fn render_review_focus_editor(frame: &mut Frame<'_>, area: Rect, input: &str) {
     let scroll = line_count.saturating_sub(visible_lines);
     let character_count = input.chars().count();
     let title = if input.is_empty() {
-        " Focus instructions ".to_string()
+        format!(" {base_title} ")
     } else if scroll > 0 {
         format!(
-            " Focus instructions · {character_count} chars · latest {visible_lines}/{line_count} lines "
+            " {base_title} · {character_count} chars · latest {visible_lines}/{line_count} lines "
         )
     } else {
-        format!(" Focus instructions · {character_count} chars ")
+        format!(" {base_title} · {character_count} chars ")
     };
 
     frame.render_widget(block.title(title), area);
@@ -1926,7 +2033,8 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("A careful review."));
         assert!(rendered.contains("BLOCKING"));
-        assert!(rendered.contains("o optional OpenCode chat"));
+        assert!(rendered.contains("f follow up"));
+        assert!(rendered.contains("n new session"));
         assert!(rendered.contains("p post"));
 
         app.handle_key(crossterm::event::KeyEvent::new(
@@ -1950,6 +2058,39 @@ mod tests {
         assert!(rendered.contains("Post this draft as REQUEST CHANGES?"));
         assert!(rendered.contains("performs a real GitHub review action"));
         assert!(rendered.contains("y / Enter  post now"));
+    }
+
+    #[test]
+    fn saved_review_controls_stay_complete_on_a_narrow_terminal() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(true, true));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("f follow up"));
+        assert!(rendered.contains("r re-review"));
+        assert!(rendered.contains("n new session"));
+        assert!(rendered.contains("o chat"));
+        assert!(rendered.contains("p post"));
+        assert!(rendered.contains("Esc close"));
     }
 
     #[test]
@@ -1982,6 +2123,77 @@ mod tests {
         assert!(rendered.contains("Kritikon is not blocked"));
         assert!(rendered.contains("attach OpenCode"));
         assert!(rendered.contains("Ctrl+X then Q or /exit detaches"));
+    }
+
+    #[test]
+    fn follow_up_keeps_the_previous_review_visible_and_new_session_is_explicit() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        let snapshot = review_snapshot(true, true);
+        app.show_review_snapshot(snapshot.clone());
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let follow_up_prompt = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(follow_up_prompt.contains("Follow up on the saved review"));
+        assert!(follow_up_prompt.contains("current Markdown stays visible and safe"));
+        assert!(follow_up_prompt.contains("Describe the question"));
+        assert!(follow_up_prompt.contains("Follow-up instructions"));
+        assert!(follow_up_prompt.contains("Describe what to revisit"));
+
+        app.review_started(snapshot.clone());
+        app.review_session_ready(snapshot.clone());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let running = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(running.contains("FOLLOW-UP REVIEWING"));
+        assert!(running.contains("Previous draft"));
+        assert!(running.contains("A careful review."));
+
+        app.review_completed(snapshot);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let confirmation = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(confirmation.contains("completely new OpenCode session"));
+        assert!(confirmation.contains("clears the saved draft"));
+        assert!(confirmation.contains("keep current session and draft"));
     }
 
     #[test]
@@ -2074,7 +2286,7 @@ mod tests {
             .join("\n");
         assert!(panel.contains("No saved draft yet"));
         assert!(panel.contains("r rerun"));
-        assert!(panel.contains("o resume OpenCode chat"));
+        assert!(panel.contains("o resume chat"));
         assert!(!panel.contains("p post"));
     }
 

@@ -13,7 +13,7 @@ use crate::{
     config::{Config, parse_refresh_seconds},
     github,
     model::{DashboardData, InvolvementReason, PullRequest},
-    review_agent::{LaunchMode, ReviewKind, ReviewSnapshot, ReviewTarget},
+    review_agent::{LaunchMode, ReviewKind, ReviewRunKind, ReviewSnapshot, ReviewTarget},
 };
 #[cfg(debug_assertions)]
 use crate::{dev, dev::DevScenario};
@@ -118,6 +118,7 @@ pub enum ReviewPanelMode {
     Prompt,
     Running(ReviewRunPhase),
     Draft,
+    ConfirmNewSession,
     PostChoice,
     ConfirmPost(ReviewKind),
     Error,
@@ -143,6 +144,7 @@ pub enum ReviewAgentState {
 pub struct ReviewPanel {
     pub snapshot: ReviewSnapshot,
     pub mode: ReviewPanelMode,
+    pub run_kind: ReviewRunKind,
     pub input: String,
     pub scroll: u16,
     pub max_scroll: u16,
@@ -282,6 +284,7 @@ impl App {
         self.present_review_panel(ReviewPanel {
             snapshot,
             mode,
+            run_kind: ReviewRunKind::ReReview,
             input: String::new(),
             scroll: 0,
             max_scroll: 0,
@@ -358,6 +361,26 @@ impl App {
         let error = error.into();
         let target_url = snapshot.target.url.clone();
         self.active_reviews.remove(&target_url);
+        if snapshot.has_draft() {
+            let mut preserved = snapshot;
+            preserved.warning = Some(format!(
+                "The follow-up could not produce a replacement. The previous draft was preserved. {error}"
+            ));
+            let panel = Self::panel_for_snapshot(preserved, ReviewPanelMode::Draft, None);
+            if self
+                .review_panel
+                .as_ref()
+                .is_some_and(|panel| panel.snapshot.target.url == target_url)
+            {
+                self.present_review_panel(panel);
+            } else {
+                self.review_panels.insert(target_url, panel);
+                self.set_notice(
+                    "OpenCode follow-up failed; the previous review draft was preserved",
+                );
+            }
+            return;
+        }
         if self
             .review_panel
             .as_ref()
@@ -423,6 +446,7 @@ impl App {
             .or_else(|| self.review_panels.get(target_url))
             .and_then(|panel| match panel.mode {
                 ReviewPanelMode::Draft
+                | ReviewPanelMode::ConfirmNewSession
                 | ReviewPanelMode::PostChoice
                 | ReviewPanelMode::ConfirmPost(_) => {
                     if panel.snapshot.has_draft() {
@@ -520,6 +544,7 @@ impl App {
         ReviewPanel {
             snapshot,
             mode,
+            run_kind: ReviewRunKind::ReReview,
             input: String::new(),
             scroll: 0,
             max_scroll: 0,
@@ -990,15 +1015,28 @@ impl App {
         match mode {
             ReviewPanelMode::Prompt => match key.code {
                 KeyCode::Esc => {
-                    self.close_review_panel();
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    if panel.snapshot.has_session() || panel.snapshot.has_draft() {
+                        panel.mode = ReviewPanelMode::Draft;
+                        panel.input.clear();
+                        panel.error = None;
+                    } else {
+                        self.close_review_panel();
+                    }
                     Action::None
                 }
                 KeyCode::Enter => {
-                    let panel = self.review_panel.as_ref().expect("review panel exists");
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    if panel.run_kind == ReviewRunKind::FollowUp && panel.input.trim().is_empty() {
+                        panel.error = Some(
+                            "Describe what OpenCode should revisit in the saved review.".into(),
+                        );
+                        return Action::None;
+                    }
                     let focus = (!panel.input.trim().is_empty()).then(|| panel.input.clone());
                     Action::LaunchReview {
                         target: panel.snapshot.target.clone(),
-                        mode: LaunchMode::Review,
+                        mode: LaunchMode::Review(panel.run_kind),
                         focus,
                     }
                 }
@@ -1008,6 +1046,10 @@ impl App {
                         .expect("review panel exists")
                         .input
                         .pop();
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .error = None;
                     Action::None
                 }
                 KeyCode::Delete => {
@@ -1016,6 +1058,10 @@ impl App {
                         .expect("review panel exists")
                         .input
                         .clear();
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .error = None;
                     Action::None
                 }
                 KeyCode::Char(character)
@@ -1028,6 +1074,10 @@ impl App {
                         .expect("review panel exists")
                         .input
                         .push(character);
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .error = None;
                     Action::None
                 }
                 _ => Action::None,
@@ -1045,6 +1095,34 @@ impl App {
                         focus: None,
                     }
                 }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll_review(-1);
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll_review(1);
+                    Action::None
+                }
+                KeyCode::PageUp => {
+                    self.scroll_review(-(self.visible_rows as isize));
+                    Action::None
+                }
+                KeyCode::PageDown => {
+                    self.scroll_review(self.visible_rows as isize);
+                    Action::None
+                }
+                KeyCode::Home => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .scroll = 0;
+                    Action::None
+                }
+                KeyCode::End => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.scroll = panel.max_scroll;
+                    Action::None
+                }
                 _ => Action::None,
             },
             ReviewPanelMode::Draft => match key.code {
@@ -1056,14 +1134,32 @@ impl App {
                     let panel = self.review_panel.as_ref().expect("review panel exists");
                     Action::LaunchReview {
                         target: panel.snapshot.target.clone(),
-                        mode: LaunchMode::Review,
+                        mode: LaunchMode::Review(ReviewRunKind::ReReview),
                         focus: None,
                     }
                 }
-                KeyCode::Char('e') => {
+                KeyCode::Char('f') | KeyCode::Char('e') => {
                     let panel = self.review_panel.as_mut().expect("review panel exists");
                     panel.mode = ReviewPanelMode::Prompt;
+                    panel.run_kind = if panel.snapshot.has_draft() && panel.snapshot.has_session() {
+                        ReviewRunKind::FollowUp
+                    } else {
+                        ReviewRunKind::ReReview
+                    };
                     panel.input.clear();
+                    panel.error = None;
+                    Action::None
+                }
+                KeyCode::Char('n')
+                    if self
+                        .review_panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.snapshot.has_session()) =>
+                {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::ConfirmNewSession;
                     Action::None
                 }
                 KeyCode::Char('o') => {
@@ -1111,6 +1207,24 @@ impl App {
                 KeyCode::End => {
                     let panel = self.review_panel.as_mut().expect("review panel exists");
                     panel.scroll = panel.max_scroll;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            ReviewPanelMode::ConfirmNewSession => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let panel = self.review_panel.as_ref().expect("review panel exists");
+                    Action::LaunchReview {
+                        target: panel.snapshot.target.clone(),
+                        mode: LaunchMode::Review(ReviewRunKind::NewSession),
+                        focus: None,
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::Draft;
                     Action::None
                 }
                 _ => Action::None,
@@ -1722,7 +1836,7 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)),
             Action::LaunchReview {
                 target: snapshot.target,
-                mode: LaunchMode::Review,
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
                 focus: Some("race conditions".into()),
             }
         );
@@ -1749,7 +1863,7 @@ mod tests {
             app.handle_key(key(KeyCode::Char('r'))),
             Action::LaunchReview {
                 target: snapshot.target.clone(),
-                mode: LaunchMode::Review,
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
                 focus: None,
             }
         );
@@ -1767,6 +1881,105 @@ mod tests {
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Action::PostReview(snapshot, ReviewKind::Comment)
+        );
+    }
+
+    #[test]
+    fn saved_review_separates_follow_up_rereview_and_new_session_flows() {
+        let mut app = app();
+        let snapshot = review_snapshot(true, true);
+        app.show_review_snapshot(snapshot.clone());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('f'))), Action::None);
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.mode, ReviewPanelMode::Prompt);
+        assert_eq!(panel.run_kind, ReviewRunKind::FollowUp);
+        assert_eq!(panel.snapshot.draft, snapshot.draft);
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(
+            app.review_panel
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("what OpenCode should revisit"))
+        );
+        for character in "verify the cancellation finding".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::FollowUp),
+                focus: Some("verify the cancellation finding".into()),
+            }
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().run_kind,
+            ReviewRunKind::FollowUp
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('r'))),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                focus: None,
+            }
+        );
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::ConfirmNewSession
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), Action::None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target,
+                mode: LaunchMode::Review(ReviewRunKind::NewSession),
+                focus: None,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_follow_up_restores_the_previous_draft_instead_of_an_error_only_panel() {
+        let mut app = app();
+        let snapshot = review_snapshot(true, true);
+        let target_url = snapshot.target.url.clone();
+        app.review_started(snapshot.clone());
+
+        app.review_background_failed(snapshot.clone(), "replacement file was not written");
+
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.mode, ReviewPanelMode::Draft);
+        assert_eq!(panel.snapshot.draft, snapshot.draft);
+        assert!(
+            panel
+                .snapshot
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("previous draft was preserved"))
+        );
+        assert_eq!(
+            app.review_agent_state(&target_url),
+            Some(ReviewAgentState::Draft)
         );
     }
 
