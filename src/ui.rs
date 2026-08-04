@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, ConfigFocus, ReviewPanelMode, RowHitbox, Tab},
+    app::{App, ConfigFocus, ReviewPanelMode, ReviewRunPhase, RowHitbox, Tab},
     config::MIN_REFRESH_SECONDS,
     model::{
         CheckState, DisplayReviewState, MergeableState, PullRequest, ReviewState, ReviewerKind,
@@ -723,6 +723,30 @@ fn render_compact_details(
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let status = if let Some((notice, _)) = &app.notice {
         Span::styled(notice.clone(), Style::default().fg(ACCENT))
+    } else if app.active_review_count() > 0 || !app.ready_review_labels().is_empty() {
+        let ready = app.ready_review_labels();
+        let activity = if app.active_review_count() == 0 {
+            format!("OpenCode review ready: {}", ready.join(", "))
+        } else {
+            let ready_status = if ready.is_empty() {
+                String::new()
+            } else {
+                format!(" · ready: {}", ready.join(", "))
+            };
+            format!(
+                "OpenCode: {} background review{} running{ready_status}",
+                app.active_review_count(),
+                if app.active_review_count() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        };
+        Span::styled(
+            format!("{activity} · Shift+R to inspect"),
+            Style::default().fg(Color::Yellow),
+        )
     } else if app.loading && app.data.is_some() {
         Span::styled("Refreshing…", Style::default().fg(Color::Yellow))
     } else if app.commit_loading && app.data.is_some() {
@@ -804,7 +828,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )),
         Line::raw("  ↑/↓ or j/k  move     PgUp/PgDn  page     Home/End  jump"),
         Line::raw("  Tab/Shift+Tab or ←/→  switch views     Enter/o  open in browser"),
-        Line::raw("  c  copy branch     Shift+C  copy URL     Shift+R  OpenCode review"),
+        Line::raw("  c  copy branch     Shift+C  copy URL     Shift+R  background OpenCode review"),
         Line::raw("  d  expand details   t  refresh timer    r  refresh    q  quit"),
         Line::raw("  Mouse wheel scrolls; a single left-click on a PR opens it."),
         Line::raw(""),
@@ -964,7 +988,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         "Review the actual diff for correctness, regressions, security, data loss, concurrency, and missing tests.",
                     ),
                     Line::raw(
-                        "OpenCode runs with permission auto-approval in a managed scratch checkout. It is instructed not to edit product files or post to GitHub.",
+                        "OpenCode runs headlessly with permission auto-approval in a managed scratch checkout. Kritikon remains usable while it works.",
                     ),
                     Line::raw(
                         "It must save the proposed review to .kritikon/review.md. Kritikon preserves the session for later chat and re-review.",
@@ -991,7 +1015,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     ]),
                     Line::raw(""),
                     Line::from(Span::styled(
-                        "Enter start review in OpenCode  ·  Backspace edit  ·  Delete clear  ·  Esc cancel",
+                        "Enter run in background  ·  Backspace edit  ·  Delete clear  ·  Esc cancel",
                         Style::default().fg(MUTED),
                     )),
                 ])
@@ -1002,6 +1026,54 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         .border_style(Style::default().fg(Color::DarkGray)),
                 ),
                 chunks[2],
+            );
+        }
+        ReviewPanelMode::Running(phase) => {
+            let (status, detail, color) = match phase {
+                ReviewRunPhase::Preparing => (
+                    "PREPARING",
+                    "Refreshing the isolated PR checkout and starting a private loopback OpenCode server.",
+                    Color::Yellow,
+                ),
+                ReviewRunPhase::Reviewing => (
+                    "REVIEWING",
+                    "The agent is reviewing in the background. Its draft will appear here when complete.",
+                    ACCENT,
+                ),
+            };
+            frame.render_widget(
+                Paragraph::new([
+                    header,
+                    vec![
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            status,
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::raw(""),
+                        Line::from(detail),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Kritikon is not blocked. Press Esc to return to the dashboard; the review keeps running.",
+                            Style::default().fg(Color::Green),
+                        )),
+                        Line::raw(""),
+                        if phase == ReviewRunPhase::Reviewing {
+                            Line::from(Span::styled(
+                                "o  attach OpenCode · there, Ctrl+X then Q or /exit detaches back here · Esc  dashboard",
+                                Style::default().fg(MUTED),
+                            ))
+                        } else {
+                            Line::from(Span::styled(
+                                "The attach option appears as soon as the resumable session is ready · Esc  dashboard",
+                                Style::default().fg(MUTED),
+                            ))
+                        },
+                    ],
+                ]
+                .concat())
+                .wrap(Wrap { trim: true }),
+                inner,
             );
         }
         ReviewPanelMode::Draft => {
@@ -1044,7 +1116,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             frame.render_widget(paragraph.scroll((scroll.min(max_scroll), 0)), chunks[1]);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "↑↓/jk scroll  ·  r re-review  ·  e custom focus  ·  o OpenCode chat  ·  p post  ·  Esc close",
+                    "↑↓/jk scroll  ·  r re-review  ·  e custom focus  ·  o optional OpenCode chat  ·  p post  ·  Esc close",
                     Style::default().fg(MUTED),
                 ))),
                 chunks[2],
@@ -1663,7 +1735,7 @@ mod tests {
         assert!(rendered.contains("acme/platform"));
         assert!(rendered.contains("refreshes incrementally"));
         assert!(rendered.contains("Shift+C  copy URL"));
-        assert!(rendered.contains("Shift+R  OpenCode review"));
+        assert!(rendered.contains("Shift+R  background OpenCode review"));
     }
 
     #[test]
@@ -1695,7 +1767,7 @@ mod tests {
         assert!(rendered.contains("Default review template"));
         assert!(rendered.contains("permission auto-approval"));
         assert!(rendered.contains("Optional focus"));
-        assert!(rendered.contains("Enter start review in OpenCode"));
+        assert!(rendered.contains("Enter run in background"));
     }
 
     #[test]
@@ -1725,7 +1797,7 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("A careful review."));
         assert!(rendered.contains("BLOCKING"));
-        assert!(rendered.contains("o OpenCode chat"));
+        assert!(rendered.contains("o optional OpenCode chat"));
         assert!(rendered.contains("p post"));
 
         app.handle_key(crossterm::event::KeyEvent::new(
@@ -1749,5 +1821,72 @@ mod tests {
         assert!(rendered.contains("Post this draft as REQUEST CHANGES?"));
         assert!(rendered.contains("performs a real GitHub review action"));
         assert!(rendered.contains("y / Enter  post now"));
+    }
+
+    #[test]
+    fn running_review_explains_background_and_detach_behavior() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.review_started(review_snapshot(false, false));
+        app.review_session_ready(review_snapshot(true, false));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("REVIEWING"));
+        assert!(rendered.contains("Kritikon is not blocked"));
+        assert!(rendered.contains("attach OpenCode"));
+        assert!(rendered.contains("Ctrl+X then Q or /exit detaches"));
+    }
+
+    #[test]
+    fn completed_background_review_remains_visible_in_the_footer() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.review_started(review_snapshot(false, false));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.review_completed(review_snapshot(true, true));
+        app.notice = None;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("OpenCode review ready: acme/app#42"));
+        assert!(rendered.contains("Shift+R to inspect"));
     }
 }

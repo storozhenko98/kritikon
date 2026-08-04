@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -115,10 +116,17 @@ pub struct ConfigEditor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewPanelMode {
     Prompt,
+    Running(ReviewRunPhase),
     Draft,
     PostChoice,
     ConfirmPost(ReviewKind),
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRunPhase {
+    Preparing,
+    Reviewing,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +137,12 @@ pub struct ReviewPanel {
     pub scroll: u16,
     pub max_scroll: u16,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveReview {
+    snapshot: ReviewSnapshot,
+    phase: ReviewRunPhase,
 }
 
 impl ConfigEditor {
@@ -177,6 +191,8 @@ pub struct App {
     pub config_editor: Option<ConfigEditor>,
     pub config_hitboxes: ConfigHitboxes,
     pub review_panel: Option<ReviewPanel>,
+    active_reviews: HashMap<String, ActiveReview>,
+    ready_reviews: HashMap<String, String>,
     pub refresh_remaining: Duration,
     pub data_source: DataSource,
     refresh_receiver: Option<Receiver<RefreshMessage>>,
@@ -211,6 +227,8 @@ impl App {
             config_editor: None,
             config_hitboxes: ConfigHitboxes::default(),
             review_panel: None,
+            active_reviews: HashMap::new(),
+            ready_reviews: HashMap::new(),
             refresh_remaining: Duration::ZERO,
             data_source,
             refresh_receiver: None,
@@ -241,6 +259,7 @@ impl App {
     }
 
     pub fn show_review_snapshot(&mut self, snapshot: ReviewSnapshot) {
+        self.ready_reviews.remove(&snapshot.target.url);
         let mode = if snapshot.has_session() || snapshot.has_draft() {
             ReviewPanelMode::Draft
         } else {
@@ -251,6 +270,124 @@ impl App {
         self.review_panel = Some(ReviewPanel {
             snapshot,
             mode,
+            input: String::new(),
+            scroll: 0,
+            max_scroll: 0,
+            error: None,
+        });
+    }
+
+    pub fn review_started(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        self.ready_reviews.remove(&target_url);
+        self.active_reviews.insert(
+            target_url,
+            ActiveReview {
+                snapshot: snapshot.clone(),
+                phase: ReviewRunPhase::Preparing,
+            },
+        );
+        self.show_running_review(snapshot, ReviewRunPhase::Preparing);
+    }
+
+    pub fn review_session_ready(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        self.active_reviews.insert(
+            target_url.clone(),
+            ActiveReview {
+                snapshot: snapshot.clone(),
+                phase: ReviewRunPhase::Reviewing,
+            },
+        );
+        if self
+            .review_panel
+            .as_ref()
+            .is_some_and(|panel| panel.snapshot.target.url == target_url)
+        {
+            self.show_running_review(snapshot, ReviewRunPhase::Reviewing);
+        }
+    }
+
+    pub fn review_completed(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        self.active_reviews.remove(&target_url);
+        if self.review_panel.as_ref().is_some_and(|panel| {
+            panel.snapshot.target.url == target_url
+                && matches!(panel.mode, ReviewPanelMode::Running(_))
+        }) {
+            self.show_review_snapshot(snapshot);
+        } else {
+            self.ready_reviews.insert(
+                target_url,
+                format!("{}#{}", snapshot.target.repository, snapshot.target.number),
+            );
+            self.set_notice(format!(
+                "OpenCode review ready: {}#{} — Shift+R to inspect",
+                snapshot.target.repository, snapshot.target.number
+            ));
+        }
+    }
+
+    pub fn review_background_failed(&mut self, snapshot: ReviewSnapshot, error: impl Into<String>) {
+        let error = error.into();
+        let target_url = snapshot.target.url.clone();
+        self.active_reviews.remove(&target_url);
+        if self
+            .review_panel
+            .as_ref()
+            .is_some_and(|panel| panel.snapshot.target.url == target_url)
+        {
+            self.show_review_snapshot(snapshot);
+            if let Some(panel) = &mut self.review_panel {
+                panel.mode = ReviewPanelMode::Error;
+                panel.error = Some(error);
+            }
+        } else {
+            self.set_notice(format!(
+                "OpenCode review failed — Shift+R to inspect: {error}"
+            ));
+        }
+    }
+
+    pub fn show_active_review(&mut self, target_url: &str) -> bool {
+        let Some(active) = self.active_reviews.get(target_url).cloned() else {
+            return false;
+        };
+        self.show_running_review(active.snapshot, active.phase);
+        true
+    }
+
+    pub fn review_chat_closed(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        if let Some(active) = self.active_reviews.get_mut(&target_url) {
+            active.snapshot = snapshot.clone();
+            let phase = active.phase;
+            self.show_running_review(snapshot, phase);
+        } else {
+            self.show_review_snapshot(snapshot);
+        }
+    }
+
+    pub fn active_review_count(&self) -> usize {
+        self.active_reviews.len()
+    }
+
+    pub fn ready_review_labels(&self) -> Vec<&str> {
+        let mut labels = self
+            .ready_reviews
+            .values()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        labels
+    }
+
+    fn show_running_review(&mut self, snapshot: ReviewSnapshot, phase: ReviewRunPhase) {
+        self.show_help = false;
+        self.config_editor = None;
+        self.review_panel = Some(ReviewPanel {
+            snapshot,
+            mode: ReviewPanelMode::Running(phase),
             input: String::new(),
             scroll: 0,
             max_scroll: 0,
@@ -788,6 +925,21 @@ impl App {
                         .input
                         .push(character);
                     Action::None
+                }
+                _ => Action::None,
+            },
+            ReviewPanelMode::Running(phase) => match key.code {
+                KeyCode::Esc => {
+                    self.review_panel = None;
+                    Action::None
+                }
+                KeyCode::Char('o') if phase == ReviewRunPhase::Reviewing => {
+                    let panel = self.review_panel.as_ref().expect("review panel exists");
+                    Action::LaunchReview {
+                        target: panel.snapshot.target.clone(),
+                        mode: LaunchMode::Chat,
+                        focus: None,
+                    }
                 }
                 _ => Action::None,
             },
@@ -1508,6 +1660,67 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)),
             Action::PostReview(snapshot, ReviewKind::Comment)
         );
+    }
+
+    #[test]
+    fn background_review_can_be_closed_reopened_attached_and_completed() {
+        let mut app = app();
+        let initial = review_snapshot(false, false);
+        let target_url = initial.target.url.clone();
+        app.review_started(initial);
+        assert_eq!(app.active_review_count(), 1);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Running(ReviewRunPhase::Preparing)
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('o'))), Action::None);
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.review_panel.is_none());
+        assert!(app.show_active_review(&target_url));
+
+        let ready = review_snapshot(true, false);
+        app.review_session_ready(ready.clone());
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Running(ReviewRunPhase::Reviewing)
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o'))),
+            Action::LaunchReview {
+                target: ready.target.clone(),
+                mode: LaunchMode::Chat,
+                focus: None,
+            }
+        );
+
+        let completed = review_snapshot(true, true);
+        app.review_completed(completed.clone());
+        assert_eq!(app.active_review_count(), 0);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
+        );
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().snapshot.draft,
+            completed.draft
+        );
+    }
+
+    #[test]
+    fn completed_background_review_stays_marked_ready_until_opened() {
+        let mut app = app();
+        let initial = review_snapshot(false, false);
+        app.review_started(initial);
+        app.handle_key(key(KeyCode::Esc));
+
+        let completed = review_snapshot(true, true);
+        app.review_completed(completed.clone());
+        assert!(app.review_panel.is_none());
+        assert_eq!(app.ready_review_labels(), vec!["acme/app#1"]);
+
+        app.show_review_snapshot(completed);
+        assert!(app.ready_review_labels().is_empty());
     }
 
     #[test]

@@ -9,6 +9,8 @@ mod review_agent;
 mod ui;
 mod updater;
 
+#[cfg(debug_assertions)]
+use std::time::Instant;
 use std::{
     io::{self, stdout},
     time::Duration,
@@ -153,6 +155,9 @@ fn run_tui(
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
     let mut app = App::new(settings, store.path().to_path_buf(), source);
+    let mut review_coordinator = review_agent::ReviewCoordinator::system()?;
+    #[cfg(debug_assertions)]
+    let mut development_review_events = Vec::<(Instant, review_agent::ReviewEvent)>::new();
     if let Some(error) = config_error {
         app.open_config(Some(format!(
             "Saved configuration is invalid; safe defaults are active. {error}"
@@ -167,6 +172,22 @@ fn run_tui(
     app.begin_refresh();
 
     loop {
+        for event in review_coordinator.drain_events() {
+            apply_review_event(&mut app, event);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let now = Instant::now();
+            let mut index = 0;
+            while index < development_review_events.len() {
+                if development_review_events[index].0 <= now {
+                    let (_, event) = development_review_events.remove(index);
+                    apply_review_event(&mut app, event);
+                } else {
+                    index += 1;
+                }
+            }
+        }
         app.tick();
         terminal
             .draw(|frame| ui::render(frame, &mut app))
@@ -200,6 +221,9 @@ fn run_tui(
                     }
                 },
                 Action::OpenReview(target) => {
+                    if app.show_active_review(&target.url) {
+                        continue;
+                    }
                     #[cfg(debug_assertions)]
                     let result = if source != DataSource::Github {
                         Ok(review_agent::development_snapshot(target.clone()))
@@ -222,24 +246,70 @@ fn run_tui(
                 } => {
                     #[cfg(debug_assertions)]
                     if source != DataSource::Github {
-                        let mut snapshot = review_agent::development_snapshot(target);
-                        if let Some(focus) = focus {
-                            snapshot.warning = Some(format!(
-                                "DEV simulation used custom focus: {}",
-                                focus.trim()
-                            ));
+                        match mode {
+                            review_agent::LaunchMode::Review => {
+                                let mut preparing =
+                                    review_agent::development_snapshot(target.clone());
+                                preparing.session_id = None;
+                                preparing.draft = None;
+                                app.review_started(preparing);
+
+                                let mut running =
+                                    review_agent::development_snapshot(target.clone());
+                                running.draft = None;
+                                let mut completed = review_agent::development_snapshot(target);
+                                if let Some(focus) = focus {
+                                    completed.warning = Some(format!(
+                                        "DEV simulation used custom focus: {}",
+                                        focus.trim()
+                                    ));
+                                }
+                                let now = Instant::now();
+                                development_review_events.push((
+                                    now + Duration::from_millis(600),
+                                    review_agent::ReviewEvent::SessionReady(running),
+                                ));
+                                development_review_events.push((
+                                    now + Duration::from_secs(2),
+                                    review_agent::ReviewEvent::Completed(completed),
+                                ));
+                            }
+                            review_agent::LaunchMode::Chat => {
+                                app.set_notice(
+                                    "DEV: simulated OpenCode attach/detach; background review continues",
+                                );
+                            }
                         }
-                        app.show_review_snapshot(snapshot);
                         continue;
                     }
 
-                    suspend_terminal(&mut terminal)?;
-                    let result = review_agent::launch(target.clone(), mode, focus.as_deref())
-                        .map_err(|error| format!("{error:#}"));
-                    resume_terminal(&mut terminal)?;
-                    match result {
-                        Ok(snapshot) => app.show_review_snapshot(snapshot),
-                        Err(error) => app.show_review_error(target, error),
+                    match mode {
+                        review_agent::LaunchMode::Review => {
+                            match review_coordinator.start_review(target.clone(), focus) {
+                                Ok(snapshot) => app.review_started(snapshot),
+                                Err(error) => {
+                                    app.show_review_error(target, format!("{error:#}"));
+                                }
+                            }
+                        }
+                        review_agent::LaunchMode::Chat => {
+                            let snapshot = match review_agent::inspect(target.clone()) {
+                                Ok(snapshot) => snapshot,
+                                Err(error) => {
+                                    app.show_review_error(target, format!("{error:#}"));
+                                    continue;
+                                }
+                            };
+                            suspend_terminal(&mut terminal)?;
+                            let result = review_coordinator
+                                .open_chat(&snapshot)
+                                .map_err(|error| format!("{error:#}"));
+                            resume_terminal(&mut terminal)?;
+                            match result {
+                                Ok(snapshot) => app.review_chat_closed(snapshot),
+                                Err(error) => app.show_review_error(target, error),
+                            }
+                        }
                     }
                 }
                 Action::PostReview(snapshot, kind) => {
@@ -267,6 +337,20 @@ fn run_tui(
     }
 
     Ok(())
+}
+
+fn apply_review_event(app: &mut App, event: review_agent::ReviewEvent) {
+    match event {
+        review_agent::ReviewEvent::SessionReady(snapshot) => {
+            app.review_session_ready(snapshot);
+        }
+        review_agent::ReviewEvent::Completed(snapshot) => {
+            app.review_completed(snapshot);
+        }
+        review_agent::ReviewEvent::Failed { snapshot, error } => {
+            app.review_background_failed(snapshot, error);
+        }
+    }
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

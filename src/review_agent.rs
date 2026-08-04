@@ -1,12 +1,21 @@
 use std::{
+    collections::HashMap,
     env, fs,
-    io::Write,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
-    process::{Command, Output},
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -42,6 +51,29 @@ impl From<&PullRequest> for ReviewTarget {
 pub enum LaunchMode {
     Review,
     Chat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewEvent {
+    SessionReady(ReviewSnapshot),
+    Completed(ReviewSnapshot),
+    Failed {
+        snapshot: ReviewSnapshot,
+        error: String,
+    },
+}
+
+impl ReviewEvent {
+    fn target_url(&self) -> &str {
+        match self {
+            Self::SessionReady(snapshot) | Self::Completed(snapshot) => &snapshot.target.url,
+            Self::Failed { snapshot, .. } => &snapshot.target.url,
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed(_) | Self::Failed { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +138,218 @@ pub struct ReviewStore {
     workspace_root: PathBuf,
 }
 
+pub struct ReviewCoordinator {
+    store: ReviewStore,
+    dependencies: ReviewDependencies,
+    sender: Sender<ReviewEvent>,
+    receiver: Receiver<ReviewEvent>,
+    active: HashMap<String, Arc<JobControl>>,
+}
+
+impl ReviewCoordinator {
+    pub fn system() -> Result<Self> {
+        let (sender, receiver) = mpsc::channel();
+        Ok(Self {
+            store: ReviewStore::system()?,
+            dependencies: ReviewDependencies {
+                gh: env::var_os("KRITIKON_GH_BIN")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("gh")),
+                opencode: env::var_os("KRITIKON_OPENCODE_BIN")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("opencode")),
+                model: env::var("KRITIKON_OPENCODE_MODEL").ok(),
+            },
+            sender,
+            receiver,
+            active: HashMap::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn at(store: ReviewStore, gh: PathBuf, opencode: PathBuf, model: Option<String>) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            store,
+            dependencies: ReviewDependencies {
+                gh,
+                opencode,
+                model,
+            },
+            sender,
+            receiver,
+            active: HashMap::new(),
+        }
+    }
+
+    pub fn start_review(
+        &mut self,
+        target: ReviewTarget,
+        focus: Option<String>,
+    ) -> Result<ReviewSnapshot> {
+        if self.active.contains_key(&target.url) {
+            bail!("an OpenCode review is already running for this pull request");
+        }
+
+        let initial = self.store.inspect(target.clone())?;
+        let control = Arc::new(JobControl::default());
+        self.active.insert(target.url.clone(), control.clone());
+
+        let store = self.store.clone();
+        let dependencies = self.dependencies.clone();
+        let sender = self.sender.clone();
+        let initial_for_error = initial.clone();
+        thread::spawn(move || {
+            let result = run_review_job(ReviewJob {
+                store: &store,
+                target: target.clone(),
+                focus: focus.as_deref(),
+                dependencies: &dependencies,
+                control: &control,
+                sender: &sender,
+            });
+            match result {
+                Ok(snapshot) => {
+                    let _ = sender.send(ReviewEvent::Completed(snapshot));
+                }
+                Err(error) => {
+                    let snapshot = store.inspect(target).unwrap_or(initial_for_error);
+                    let _ = sender.send(ReviewEvent::Failed {
+                        snapshot,
+                        error: format!("{error:#}"),
+                    });
+                }
+            }
+        });
+
+        Ok(initial)
+    }
+
+    pub fn drain_events(&mut self) -> Vec<ReviewEvent> {
+        let events = self.receiver.try_iter().collect::<Vec<_>>();
+        for event in &events {
+            if event.is_terminal() {
+                self.active.remove(event.target_url());
+            }
+        }
+        events
+    }
+
+    pub fn open_chat(&self, snapshot: &ReviewSnapshot) -> Result<ReviewSnapshot> {
+        let attachment_guard = self
+            .active
+            .get(&snapshot.target.url)
+            .cloned()
+            .map(AttachmentGuard::new);
+        let attachment = attachment_guard
+            .as_ref()
+            .and_then(|guard| guard.control.connection());
+        if attachment_guard.is_some() && attachment.is_none() {
+            bail!("the review workspace is still preparing; attach when the session is ready");
+        }
+        open_chat_with_dependencies(
+            &self.store,
+            snapshot,
+            &self.dependencies.opencode,
+            self.dependencies.model.as_deref(),
+            attachment.as_ref(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReviewDependencies {
+    gh: PathBuf,
+    opencode: PathBuf,
+    model: Option<String>,
+}
+
+impl Drop for ReviewCoordinator {
+    fn drop(&mut self) {
+        for control in self.active.values() {
+            control.shutdown.store(true, Ordering::Release);
+            control.terminate_processes();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServerConnection {
+    endpoint: String,
+    password: String,
+}
+
+#[derive(Debug, Default)]
+struct JobControl {
+    shutdown: AtomicBool,
+    attachments: AtomicUsize,
+    connection: Mutex<Option<ServerConnection>>,
+    processes: Mutex<Vec<u32>>,
+}
+
+impl JobControl {
+    fn connection(&self) -> Option<ServerConnection> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_connection(&self, connection: ServerConnection) {
+        *self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(connection);
+    }
+
+    fn register_process(&self, process_id: u32) {
+        self.processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(process_id);
+    }
+
+    fn unregister_process(&self, process_id: u32) {
+        self.processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|registered| *registered != process_id);
+    }
+
+    fn terminate_processes(&self) {
+        let process_ids = self
+            .processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for process_id in process_ids {
+            let _ = Command::new("kill")
+                .args(["-TERM", &process_id.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+struct AttachmentGuard {
+    control: Arc<JobControl>,
+}
+
+impl AttachmentGuard {
+    fn new(control: Arc<JobControl>) -> Self {
+        control.attachments.fetch_add(1, Ordering::AcqRel);
+        Self { control }
+    }
+}
+
+impl Drop for AttachmentGuard {
+    fn drop(&mut self) {
+        self.control.attachments.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl ReviewStore {
     pub fn system() -> Result<Self> {
         Ok(Self {
@@ -145,6 +389,7 @@ impl ReviewStore {
         ReviewPaths {
             record: directory.join("session.json"),
             draft: directory.join("review.md"),
+            log: directory.join("agent.log"),
             workspace: self.workspace_root.join(slug),
         }
     }
@@ -188,6 +433,7 @@ impl ReviewStore {
 struct ReviewPaths {
     record: PathBuf,
     draft: PathBuf,
+    log: PathBuf,
     workspace: PathBuf,
 }
 
@@ -195,86 +441,77 @@ pub fn inspect(target: ReviewTarget) -> Result<ReviewSnapshot> {
     ReviewStore::system()?.inspect(target)
 }
 
-pub fn launch(
+struct ReviewJob<'a> {
+    store: &'a ReviewStore,
     target: ReviewTarget,
-    mode: LaunchMode,
-    focus: Option<&str>,
-) -> Result<ReviewSnapshot> {
-    let opencode = env::var_os("KRITIKON_OPENCODE_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("opencode"));
-    let gh = env::var_os("KRITIKON_GH_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("gh"));
-    let model = env::var("KRITIKON_OPENCODE_MODEL").ok();
-    launch_with_dependencies(
-        &ReviewStore::system()?,
-        target,
-        mode,
-        focus,
-        &gh,
-        &opencode,
-        model.as_deref(),
-    )
+    focus: Option<&'a str>,
+    dependencies: &'a ReviewDependencies,
+    control: &'a Arc<JobControl>,
+    sender: &'a Sender<ReviewEvent>,
 }
 
-fn launch_with_dependencies(
-    store: &ReviewStore,
-    target: ReviewTarget,
-    mode: LaunchMode,
-    focus: Option<&str>,
-    gh: &Path,
-    opencode: &Path,
-    model: Option<&str>,
-) -> Result<ReviewSnapshot> {
+fn run_review_job(job: ReviewJob<'_>) -> Result<ReviewSnapshot> {
+    let ReviewJob {
+        store,
+        target,
+        focus,
+        dependencies,
+        control,
+        sender,
+    } = job;
     let mut snapshot = store.inspect(target.clone())?;
-    if mode == LaunchMode::Chat && snapshot.session_id.is_none() {
-        bail!("start a review before opening its OpenCode chat session");
+    if control.shutdown.load(Ordering::Acquire) {
+        bail!("review stopped before workspace preparation began");
     }
-
-    println!("Preparing isolated review workspace for {}…", target.url);
-    prepare_workspace(&snapshot, gh)?;
+    prepare_workspace(&snapshot, &dependencies.gh)?;
     restore_saved_draft(&snapshot)?;
 
-    let capabilities = verify_opencode(opencode)?;
+    let capabilities = verify_opencode(&dependencies.opencode)?;
     let permission_config = opencode_permission_config()?;
-    if snapshot.session_id.is_none() {
-        snapshot.session_id = newest_workspace_session(opencode, &snapshot.workspace)?;
-    }
-
-    let mut command = Command::new(opencode);
-    command.current_dir(&snapshot.workspace);
-    if capabilities.auto_flag {
-        command.arg("--auto");
-    }
-    command.arg("--agent").arg("build");
-    if let Some(session_id) = &snapshot.session_id {
-        command.arg("--session").arg(session_id);
-    }
-    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
-        command.arg("--model").arg(model);
-    }
-    if mode == LaunchMode::Review {
-        command
-            .arg("--prompt")
-            .arg(review_prompt(&target, focus.unwrap_or_default()));
-    }
-    command.env("OPENCODE_CONFIG_CONTENT", permission_config);
-
-    println!(
-        "Opening OpenCode with permission auto-approval in {}…",
-        snapshot.workspace.display()
-    );
-    let status = command
-        .status()
-        .with_context(|| format!("could not launch {}", opencode.display()))?;
-
-    let session_id = match snapshot.session_id.take() {
-        Some(session_id) => session_id,
-        None => newest_workspace_session(opencode, &snapshot.workspace)?
-            .context("OpenCode exited before Kritikon could identify a resumable session")?,
-    };
     let paths = store.paths(&target);
+    let server = start_server(
+        &dependencies.opencode,
+        &snapshot.workspace,
+        &paths.log,
+        &permission_config,
+        control,
+    )?;
+    control.set_connection(server.connection.clone());
+
+    let session_id = match snapshot.session_id.clone() {
+        Some(session_id) => session_id,
+        None => create_server_session(&server.connection, &snapshot.workspace, &target)?,
+    };
+    snapshot.session_id = Some(session_id.clone());
+    store.save_record(
+        &paths.record,
+        &ReviewRecord {
+            version: RECORD_VERSION,
+            target: target.clone(),
+            session_id: session_id.clone(),
+            updated_at: now_epoch_seconds(),
+        },
+    )?;
+    sender
+        .send(ReviewEvent::SessionReady(snapshot.clone()))
+        .context("Kritikon closed before the OpenCode session became ready")?;
+
+    let status = run_headless_review(
+        HeadlessReview {
+            opencode: &dependencies.opencode,
+            snapshot: &snapshot,
+            connection: &server.connection,
+            log_path: &paths.log,
+            permission_config: &permission_config,
+            capabilities: &capabilities,
+            model: dependencies.model.as_deref(),
+            focus: focus.unwrap_or_default(),
+        },
+        control,
+    )?;
+
+    wait_for_attachments(control)?;
+
     let workspace_draft = workspace_draft_path(&snapshot.workspace);
     let draft = store.save_draft(&workspace_draft, &paths.draft)?;
     store.save_record(
@@ -295,11 +532,144 @@ fn launch_with_dependencies(
         workspace: paths.workspace,
         warning: (!status.success()).then(|| {
             format!(
-                "OpenCode exited with {}; the session and any completed draft were preserved",
-                status
+                "The background OpenCode run exited with {status}; its session and any completed draft were preserved. Log: {}",
+                paths.log.display()
             )
         }),
     })
+}
+
+fn wait_for_attachments(control: &JobControl) -> Result<()> {
+    while control.attachments.load(Ordering::Acquire) > 0
+        && !control.shutdown.load(Ordering::Acquire)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if control.shutdown.load(Ordering::Acquire) {
+        bail!("review stopped because Kritikon exited");
+    }
+    Ok(())
+}
+
+struct HeadlessReview<'a> {
+    opencode: &'a Path,
+    snapshot: &'a ReviewSnapshot,
+    connection: &'a ServerConnection,
+    log_path: &'a Path,
+    permission_config: &'a str,
+    capabilities: &'a OpencodeCapabilities,
+    model: Option<&'a str>,
+    focus: &'a str,
+}
+
+fn run_headless_review(request: HeadlessReview<'_>, control: &JobControl) -> Result<ExitStatus> {
+    let HeadlessReview {
+        opencode,
+        snapshot,
+        connection,
+        log_path,
+        permission_config,
+        capabilities,
+        model,
+        focus,
+    } = request;
+    let log = open_private_log(log_path, true)?;
+    let mut command = Command::new(opencode);
+    command
+        .current_dir(&snapshot.workspace)
+        .arg("run")
+        .args(["--attach", &connection.endpoint])
+        .arg("--dir")
+        .arg(&snapshot.workspace)
+        .args([
+            "--session",
+            snapshot.session_id.as_deref().unwrap_or_default(),
+        ])
+        .args(["--agent", "build"])
+        .args(["--format", "json"]);
+    if capabilities.run_auto_flag {
+        command.arg("--auto");
+    }
+    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+        command.args(["--model", model]);
+    }
+    command
+        .arg(review_prompt(&snapshot.target, focus))
+        .env("OPENCODE_SERVER_PASSWORD", &connection.password)
+        .env("OPENCODE_CONFIG_CONTENT", permission_config)
+        .stdin(Stdio::null())
+        .stdout(
+            log.try_clone()
+                .context("could not clone OpenCode log file")?,
+        )
+        .stderr(log);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("could not start background {} run", opencode.display()))?;
+    let process_id = child.id();
+    control.register_process(process_id);
+    let result = wait_for_child(&mut child, control);
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    control.unregister_process(process_id);
+    result
+}
+
+fn open_chat_with_dependencies(
+    store: &ReviewStore,
+    snapshot: &ReviewSnapshot,
+    opencode: &Path,
+    model: Option<&str>,
+    connection: Option<&ServerConnection>,
+) -> Result<ReviewSnapshot> {
+    let session_id = snapshot
+        .session_id
+        .as_deref()
+        .context("start a review before opening its OpenCode chat session")?;
+    let capabilities = verify_opencode(opencode)?;
+    let permission_config = opencode_permission_config()?;
+    let mut command = Command::new(opencode);
+    command.current_dir(&snapshot.workspace);
+    if let Some(connection) = connection {
+        command
+            .arg("attach")
+            .arg(&connection.endpoint)
+            .arg("--dir")
+            .arg(&snapshot.workspace)
+            .args(["--session", session_id])
+            .env("OPENCODE_SERVER_PASSWORD", &connection.password);
+    } else {
+        if capabilities.tui_auto_flag {
+            command.arg("--auto");
+        }
+        command
+            .arg(&snapshot.workspace)
+            .args(["--session", session_id])
+            .args(["--agent", "build"]);
+        if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+            command.args(["--model", model]);
+        }
+    }
+    let status = command
+        .env("OPENCODE_CONFIG_CONTENT", permission_config)
+        .status()
+        .with_context(|| format!("could not open {} chat", opencode.display()))?;
+
+    let paths = store.paths(&snapshot.target);
+    let draft = store.save_draft(&workspace_draft_path(&snapshot.workspace), &paths.draft)?;
+    let mut refreshed = store.inspect(snapshot.target.clone())?;
+    refreshed.draft = draft;
+    if !status.success() {
+        refreshed.warning = Some(if connection.is_some() {
+            format!("OpenCode chat exited with {status}; the background review was not stopped")
+        } else {
+            format!("OpenCode chat exited with {status}; the saved session was preserved")
+        });
+    }
+    Ok(refreshed)
 }
 
 pub fn post_review(snapshot: &ReviewSnapshot, kind: ReviewKind) -> Result<()> {
@@ -377,9 +747,201 @@ fn restore_saved_draft(snapshot: &ReviewSnapshot) -> Result<()> {
     atomic_write_private(&path, draft.as_bytes())
 }
 
+struct ServerProcess {
+    child: Child,
+    connection: ServerConnection,
+    control: Arc<JobControl>,
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let process_id = self.child.id();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.control.unregister_process(process_id);
+    }
+}
+
+fn start_server(
+    opencode: &Path,
+    workspace: &Path,
+    log_path: &Path,
+    permission_config: &str,
+    control: &Arc<JobControl>,
+) -> Result<ServerProcess> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("could not reserve a loopback port for OpenCode")?;
+    let port = listener
+        .local_addr()
+        .context("could not read the reserved OpenCode port")?
+        .port();
+    drop(listener);
+
+    let password = random_server_password()?;
+    let connection = ServerConnection {
+        endpoint: format!("http://127.0.0.1:{port}"),
+        password,
+    };
+    let log = open_private_log(log_path, false)?;
+    let child = Command::new(opencode)
+        .current_dir(workspace)
+        .arg("serve")
+        .args(["--hostname", "127.0.0.1"])
+        .args(["--port", &port.to_string()])
+        .env("OPENCODE_SERVER_PASSWORD", &connection.password)
+        .env("OPENCODE_CONFIG_CONTENT", permission_config)
+        .stdin(Stdio::null())
+        .stdout(
+            log.try_clone()
+                .context("could not clone OpenCode log file")?,
+        )
+        .stderr(log)
+        .spawn()
+        .with_context(|| format!("could not start {} serve", opencode.display()))?;
+    control.register_process(child.id());
+    let mut server = ServerProcess {
+        child,
+        connection,
+        control: control.clone(),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if control.shutdown.load(Ordering::Acquire) {
+            bail!("review stopped while the OpenCode server was starting");
+        }
+        if let Some(status) = server
+            .child
+            .try_wait()
+            .context("could not inspect the OpenCode server")?
+        {
+            bail!(
+                "OpenCode server exited with {status} before becoming ready. Log: {}",
+                log_path.display()
+            );
+        }
+        if server_is_healthy(&server.connection) {
+            return Ok(server);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "OpenCode server did not become ready within 10 seconds. Log: {}",
+                log_path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn server_is_healthy(connection: &ServerConnection) -> bool {
+    let url = format!("{}/global/health", connection.endpoint);
+    let agent = local_http_agent(Duration::from_millis(250));
+    let Ok(mut response) = agent
+        .get(&url)
+        .header("Authorization", &basic_auth_header(&connection.password))
+        .call()
+    else {
+        return false;
+    };
+    response
+        .body_mut()
+        .read_json::<Value>()
+        .ok()
+        .and_then(|value| value.get("healthy").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedSession {
+    id: String,
+}
+
+fn create_server_session(
+    connection: &ServerConnection,
+    workspace: &Path,
+    target: &ReviewTarget,
+) -> Result<String> {
+    let url = format!("{}/session", connection.endpoint);
+    let title = format!("Kritikon: {}#{}", target.repository, target.number);
+    let agent = local_http_agent(Duration::from_secs(5));
+    let mut response = agent
+        .post(&url)
+        .query("directory", workspace.to_string_lossy())
+        .header("Authorization", &basic_auth_header(&connection.password))
+        .send_json(serde_json::json!({ "title": title }))
+        .context("could not create an OpenCode review session")?;
+    let session: CreatedSession = response
+        .body_mut()
+        .read_json()
+        .context("OpenCode returned an invalid session response")?;
+    if session.id.trim().is_empty() {
+        bail!("OpenCode created a review session without an ID");
+    }
+    Ok(session.id)
+}
+
+fn local_http_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
+}
+
+fn basic_auth_header(password: &str) -> String {
+    format!("Basic {}", BASE64.encode(format!("opencode:{password}")))
+}
+
+fn random_server_password() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    fs::File::open("/dev/urandom")
+        .context("could not open the operating system random source")?
+        .read_exact(&mut bytes)
+        .context("could not generate an OpenCode server password")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn wait_for_child(child: &mut Child, control: &JobControl) -> Result<ExitStatus> {
+    loop {
+        if control.shutdown.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("review stopped because Kritikon exited");
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("could not inspect the background OpenCode review")?
+        {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn open_private_log(path: &Path, append: bool) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path.parent().context("OpenCode log path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("could not open {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn open_private_log(_path: &Path, _append: bool) -> Result<fs::File> {
+    bail!("Kritikon supports OpenCode review sessions on macOS and Linux only")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OpencodeCapabilities {
-    auto_flag: bool,
+    tui_auto_flag: bool,
+    run_auto_flag: bool,
 }
 
 fn verify_opencode(opencode: &Path) -> Result<OpencodeCapabilities> {
@@ -398,9 +960,35 @@ fn verify_opencode(opencode: &Path) -> Result<OpencodeCapabilities> {
         .arg("--help")
         .output()
         .context("could not inspect OpenCode CLI capabilities")?;
-    let auto_flag = help.status.success()
-        && (contains_auto_flag(&help.stdout) || contains_auto_flag(&help.stderr));
-    Ok(OpencodeCapabilities { auto_flag })
+    let root_help = [help.stdout.as_slice(), help.stderr.as_slice()].concat();
+    let tui_auto_flag = help.status.success() && contains_auto_flag(&root_help);
+    let root_help = String::from_utf8_lossy(&root_help);
+    if !root_help.contains("opencode serve") || !root_help.contains("opencode attach") {
+        bail!(
+            "this OpenCode version does not support detached reviews; upgrade to a version with `serve`, `run --attach`, and `attach`"
+        );
+    }
+
+    let run_help = Command::new(opencode)
+        .args(["run", "--help"])
+        .output()
+        .context("could not inspect OpenCode background-run capabilities")?;
+    let run_help_text = [run_help.stdout.as_slice(), run_help.stderr.as_slice()].concat();
+    let run_help_string = String::from_utf8_lossy(&run_help_text);
+    if !run_help.status.success()
+        || !run_help_string.contains("--attach")
+        || !run_help_string.contains("--dir")
+        || !run_help_string.contains("--session")
+    {
+        bail!(
+            "this OpenCode version does not support detached reviews; upgrade to a version with `run --attach`, `--dir`, and `--session`"
+        );
+    }
+    let run_auto_flag = run_help.status.success() && contains_auto_flag(&run_help_text);
+    Ok(OpencodeCapabilities {
+        tui_auto_flag,
+        run_auto_flag,
+    })
 }
 
 fn contains_auto_flag(output: &[u8]) -> bool {
@@ -428,109 +1016,6 @@ fn merge_opencode_permission_config(existing: Option<&str>) -> Result<String> {
         serde_json::from_str(existing).context("OPENCODE_CONFIG_CONTENT must be a JSON object")?;
     config.insert("permission".into(), Value::String("allow".into()));
     serde_json::to_string(&config).context("could not enable OpenCode permission auto-approval")
-}
-
-fn newest_workspace_session(opencode: &Path, workspace: &Path) -> Result<Option<String>> {
-    match newest_workspace_session_from_cli(opencode, workspace) {
-        Ok(session_id) => Ok(session_id),
-        Err(cli_error) => {
-            let sqlite = env::var_os("KRITIKON_SQLITE_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("sqlite3"));
-            let database = opencode_database_path()?;
-            newest_workspace_session_from_database(&sqlite, &database, workspace).with_context(
-                || {
-                    format!(
-                        "OpenCode CLI session discovery failed ({cli_error:#}); the read-only database fallback also failed"
-                    )
-                },
-            )
-        }
-    }
-}
-
-fn newest_workspace_session_from_cli(opencode: &Path, workspace: &Path) -> Result<Option<String>> {
-    let output = Command::new(opencode)
-        .current_dir(workspace)
-        .args(["session", "list", "--format", "json", "--max-count", "50"])
-        .output()
-        .context("could not list OpenCode sessions")?;
-    let stdout = checked_output(output, "could not list OpenCode sessions")?;
-    let sessions: Vec<SessionListItem> =
-        serde_json::from_slice(&stdout).context("OpenCode returned an invalid session list")?;
-    let expected = canonicalish(workspace);
-    Ok(sessions
-        .into_iter()
-        .filter(|session| {
-            session.parent_id.is_none() && canonicalish(Path::new(&session.directory)) == expected
-        })
-        .max_by_key(|session| session.updated)
-        .map(|session| session.id))
-}
-
-fn newest_workspace_session_from_database(
-    sqlite: &Path,
-    database: &Path,
-    workspace: &Path,
-) -> Result<Option<String>> {
-    let output = Command::new(sqlite)
-        .args(["-readonly", "-separator", "\t"])
-        .arg(database)
-        .arg("SELECT id, time_updated, directory, COALESCE(parent_id, '') FROM session ORDER BY time_updated DESC LIMIT 100;")
-        .output()
-        .with_context(|| format!("could not run {} in read-only mode", sqlite.display()))?;
-    let stdout = checked_output(output, "could not read OpenCode's session database")?;
-    let expected = canonicalish(workspace);
-    let mut newest: Option<(u64, String)> = None;
-    for line in String::from_utf8_lossy(&stdout).lines() {
-        let mut fields = line.splitn(4, '\t');
-        let (Some(id), Some(updated), Some(directory), Some(parent_id)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        if !parent_id.is_empty() || canonicalish(Path::new(directory)) != expected {
-            continue;
-        }
-        let updated = updated.parse::<u64>().with_context(|| {
-            format!("invalid OpenCode session timestamp returned by sqlite: {updated}")
-        })?;
-        if newest
-            .as_ref()
-            .is_none_or(|(newest_updated, _)| updated > *newest_updated)
-        {
-            newest = Some((updated, id.into()));
-        }
-    }
-    Ok(newest.map(|(_, id)| id))
-}
-
-fn opencode_database_path() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("KRITIKON_OPENCODE_DB") {
-        return Ok(PathBuf::from(path));
-    }
-    let base = match env::var_os("XDG_DATA_HOME") {
-        Some(path) if Path::new(&path).is_absolute() => PathBuf::from(path),
-        _ => env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("HOME is not set; cannot locate OpenCode's session database")?
-            .join(".local")
-            .join("share"),
-    };
-    Ok(base.join("opencode").join("opencode.db"))
-}
-
-#[derive(Debug, Deserialize)]
-struct SessionListItem {
-    id: String,
-    updated: u64,
-    directory: String,
-    #[serde(default, rename = "parentID", alias = "parent_id", alias = "parentId")]
-    parent_id: Option<String>,
-}
-
-fn canonicalish(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn run_git(workspace: &Path, arguments: &[&str]) -> Result<()> {
@@ -737,6 +1222,11 @@ pub fn development_snapshot(target: ReviewTarget) -> ReviewSnapshot {
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::{
+        io::{BufRead, BufReader},
+        net::TcpListener,
+        sync::mpsc,
+    };
 
     use tempfile::tempdir;
 
@@ -854,103 +1344,311 @@ mod tests {
         assert_eq!(ReviewKind::RequestChanges.gh_flag(), "--request-changes");
     }
 
+    #[test]
+    fn server_session_creation_is_loopback_authenticated_and_directory_scoped() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            request_sender.send(request).unwrap();
+            let body = r#"{"id":"ses_background"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let connection = ServerConnection {
+            endpoint: format!("http://{address}"),
+            password: "secret".into(),
+        };
+        let session =
+            create_server_session(&connection, Path::new("/tmp/review workspace"), &target())
+                .unwrap();
+        assert_eq!(session, "ses_background");
+        let request = request_receiver.recv().unwrap();
+        assert!(
+            request.starts_with("POST /session?directory=%2Ftmp%2Freview%20workspace HTTP/1.1")
+        );
+        assert!(request.to_ascii_lowercase().contains(&format!(
+            "authorization: {}",
+            basic_auth_header("secret").to_ascii_lowercase()
+        )));
+        server.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
-    fn full_launch_chain_persists_draft_and_resumes_the_same_session() {
+    fn headless_review_uses_run_and_never_takes_over_the_terminal() {
+        let directory = tempdir().unwrap();
+        let opencode = directory.path().join("opencode");
+        let arguments = directory.path().join("run.args");
+        let permissions = directory.path().join("permissions.json");
+        let workspace = directory.path().join("workspace");
+        let log = directory.path().join("agent.log");
+        fs::create_dir_all(workspace.join(".kritikon")).unwrap();
+        write_executable(
+            &opencode,
+            &format!(
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{}'\nprintf '# Summary\\n\\nBackground complete.\\n' > .kritikon/review.md\n",
+                arguments.display(),
+                permissions.display()
+            ),
+        );
+        let snapshot = ReviewSnapshot {
+            target: target(),
+            session_id: Some("ses_background".into()),
+            draft: None,
+            draft_path: directory.path().join("saved.md"),
+            workspace: workspace.clone(),
+            warning: None,
+        };
+        let connection = ServerConnection {
+            endpoint: "http://127.0.0.1:43177".into(),
+            password: "secret".into(),
+        };
+        let status = run_headless_review(
+            HeadlessReview {
+                opencode: &opencode,
+                snapshot: &snapshot,
+                connection: &connection,
+                log_path: &log,
+                permission_config: OPENCODE_PERMISSION_CONFIG,
+                capabilities: &OpencodeCapabilities {
+                    tui_auto_flag: true,
+                    run_auto_flag: true,
+                },
+                model: Some("opencode/gpt-5.4"),
+                focus: "Check detachment.",
+            },
+            &JobControl::default(),
+        )
+        .unwrap();
+        assert!(status.success());
+        let arguments = fs::read_to_string(arguments).unwrap();
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        assert_eq!(arguments[0], "run");
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--attach", connection.endpoint.as_str()])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--dir", workspace.to_str().unwrap()])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--session", "ses_background"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--agent", "build"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--format", "json"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "opencode/gpt-5.4"])
+        );
+        assert!(arguments.contains(&"--auto"));
+        assert!(!arguments.contains(&"--prompt"));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument.contains("Check detachment."))
+        );
+        let permission: Value =
+            serde_json::from_str(&fs::read_to_string(permissions).unwrap()).unwrap();
+        assert_eq!(permission["permission"], "allow");
+        assert_eq!(
+            fs::metadata(log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_chat_uses_attach_and_returns_to_the_same_saved_session() {
         let data = tempdir().unwrap();
         let workspaces = tempdir().unwrap();
         let binaries = tempdir().unwrap();
         let store = ReviewStore::at(data.path(), workspaces.path());
-        let gh = binaries.path().join("gh");
-        let opencode = binaries.path().join("opencode");
-        let opencode_log = binaries.path().join("opencode.args");
-        let permission_log = binaries.path().join("opencode.permission.json");
+        let target = target();
+        let paths = store.paths(&target);
+        fs::create_dir_all(paths.workspace.join(".kritikon")).unwrap();
+        fs::write(
+            workspace_draft_path(&paths.workspace),
+            "# Summary\n\nUpdated while attached.\n",
+        )
+        .unwrap();
+        store
+            .save_record(
+                &paths.record,
+                &ReviewRecord {
+                    version: RECORD_VERSION,
+                    target: target.clone(),
+                    session_id: "ses_live".into(),
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
 
-        write_executable(
-            &gh,
-            r#"#!/bin/sh
-set -eu
-if [ "$1 $2" = "repo clone" ]; then
-  workspace="$4"
-  git init -q "$workspace"
-  git -C "$workspace" config user.email test@example.com
-  git -C "$workspace" config user.name Kritikon-Test
-  git -C "$workspace" commit -q --allow-empty -m initial
-  exit 0
-fi
-if [ "$1 $2" = "pr checkout" ]; then
-  exit 0
-fi
-exit 2
-"#,
-        );
+        let opencode = binaries.path().join("opencode");
+        let arguments = binaries.path().join("attach.args");
+        let password = binaries.path().join("attach.password");
         write_executable(
             &opencode,
             &format!(
                 r#"#!/bin/sh
 set -eu
-if [ "$1" = "--version" ]; then
-  echo 1.2.15
-  exit 0
-fi
+if [ "$1" = "--version" ]; then echo 1.18.13; exit 0; fi
 if [ "$1" = "--help" ]; then
-  echo '      --auto  Auto-approve permissions'
+  printf 'opencode serve\nopencode attach\n      --auto\n'
   exit 0
 fi
-if [ "$1" = "session" ]; then
-  printf '[{{"id":"ses_child","updated":3,"directory":"%s","parentID":"ses_mock"}},{{"id":"ses_mock","updated":2,"directory":"%s"}}]\n' "$(pwd)" "$(pwd)"
+if [ "$1 $2" = "run --help" ]; then
+  printf '%s\n' '--attach --dir --session --auto'
   exit 0
 fi
 printf '%s\n' "$@" > '{}'
-printf '%s' "$OPENCODE_CONFIG_CONTENT" > '{}'
-mkdir -p .kritikon
-printf '# Summary\n\nMock review complete.\n' > .kritikon/review.md
+printf '%s' "$OPENCODE_SERVER_PASSWORD" > '{}'
 "#,
-                opencode_log.display(),
-                permission_log.display()
+                arguments.display(),
+                password.display()
             ),
         );
-
-        let first = launch_with_dependencies(
+        let snapshot = store.inspect(target).unwrap();
+        let connection = ServerConnection {
+            endpoint: "http://127.0.0.1:43177".into(),
+            password: "secret".into(),
+        };
+        let refreshed = open_chat_with_dependencies(
             &store,
-            target(),
-            LaunchMode::Review,
-            Some("Check cancellation safety."),
-            &gh,
+            &snapshot,
             &opencode,
             Some("opencode/gpt-5.4"),
+            Some(&connection),
         )
         .unwrap();
-        assert_eq!(first.session_id.as_deref(), Some("ses_mock"));
+
+        assert_eq!(refreshed.session_id.as_deref(), Some("ses_live"));
         assert_eq!(
-            first.draft.as_deref(),
-            Some("# Summary\n\nMock review complete.\n")
+            refreshed.draft.as_deref(),
+            Some("# Summary\n\nUpdated while attached.\n")
         );
-        let first_arguments = fs::read_to_string(&opencode_log).unwrap();
-        assert!(first_arguments.contains("--auto\n"));
-        assert!(first_arguments.contains("--agent\nbuild\n"));
-        assert!(first_arguments.contains("--prompt\n"));
-        assert!(first_arguments.contains("--model\nopencode/gpt-5.4\n"));
-        assert!(first_arguments.contains("--session\nses_mock\n"));
-        assert!(first_arguments.contains("Check cancellation safety."));
-        let permission: Value =
-            serde_json::from_str(&fs::read_to_string(&permission_log).unwrap()).unwrap();
-        assert_eq!(permission["permission"], "allow");
+        let arguments = fs::read_to_string(arguments).unwrap();
+        assert_eq!(
+            arguments.lines().collect::<Vec<_>>(),
+            vec![
+                "attach",
+                connection.endpoint.as_str(),
+                "--dir",
+                paths.workspace.to_str().unwrap(),
+                "--session",
+                "ses_live",
+            ]
+        );
+        assert_eq!(fs::read_to_string(password).unwrap(), "secret");
+    }
 
-        let second = launch_with_dependencies(
-            &store,
-            target(),
-            LaunchMode::Chat,
-            None,
+    #[test]
+    fn worker_keeps_its_server_until_the_attached_tui_detaches() {
+        let control = Arc::new(JobControl::default());
+        let attachment = AttachmentGuard::new(control.clone());
+        let (sender, receiver) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            wait_for_attachments(&control).unwrap();
+            sender.send(()).unwrap();
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(150)).is_err());
+        drop(attachment);
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn starting_a_review_returns_before_workspace_preparation_finishes() {
+        let data = tempdir().unwrap();
+        let workspaces = tempdir().unwrap();
+        let binaries = tempdir().unwrap();
+        let gh = binaries.path().join("gh");
+        write_executable(
             &gh,
-            &opencode,
-            Some("opencode/gpt-5.4"),
-        )
-        .unwrap();
-        assert_eq!(second.session_id, first.session_id);
-        let second_arguments = fs::read_to_string(&opencode_log).unwrap();
-        assert!(second_arguments.contains("--session\nses_mock\n"));
-        assert!(!second_arguments.contains("--prompt\n"));
+            "#!/bin/sh\nsleep 1\necho delayed failure >&2\nexit 7\n",
+        );
+        let mut coordinator = ReviewCoordinator::at(
+            ReviewStore::at(data.path(), workspaces.path()),
+            gh,
+            binaries.path().join("opencode"),
+            None,
+        );
+
+        let started = Instant::now();
+        let snapshot = coordinator.start_review(target(), None).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(!snapshot.has_session());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let event = loop {
+            if let Some(event) = coordinator.drain_events().into_iter().next() {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background failure was not reported"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(matches!(event, ReviewEvent::Failed { .. }));
+    }
+
+    #[test]
+    fn coordinator_shutdown_terminates_registered_background_processes() {
+        let data = tempdir().unwrap();
+        let workspaces = tempdir().unwrap();
+        let mut coordinator = ReviewCoordinator::at(
+            ReviewStore::at(data.path(), workspaces.path()),
+            PathBuf::from("gh"),
+            PathBuf::from("opencode"),
+            None,
+        );
+        let control = Arc::new(JobControl::default());
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        control.register_process(child.id());
+        coordinator.active.insert(target().url, control);
+
+        drop(coordinator);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "background child was orphaned");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -977,40 +1675,6 @@ printf '# Summary\n\nMock review complete.\n' > .kritikon/review.md
         .unwrap();
         assert_eq!(merged["permission"], "allow");
         assert_eq!(merged["model"], "opencode/gpt-5.4");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn session_discovery_has_a_read_only_database_fallback() {
-        let directory = tempdir().unwrap();
-        let workspace = directory.path().join("workspace");
-        fs::create_dir(&workspace).unwrap();
-        let sqlite = directory.path().join("sqlite3");
-        let arguments = directory.path().join("sqlite.args");
-        write_executable(
-            &sqlite,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'ses_other\\t22\\t/tmp/other\\t\\nses_child\\t21\\t{}\\tses_expected\\nses_expected\\t19\\t{}\\t\\n'\n",
-                arguments.display(),
-                workspace.display(),
-                workspace.display()
-            ),
-        );
-
-        let session = newest_workspace_session_from_database(
-            &sqlite,
-            &directory.path().join("opencode.db"),
-            &workspace,
-        )
-        .unwrap();
-        assert_eq!(session.as_deref(), Some("ses_expected"));
-        let arguments = fs::read_to_string(arguments).unwrap();
-        assert!(arguments.lines().any(|argument| argument == "-readonly"));
-        assert!(
-            arguments
-                .lines()
-                .any(|argument| argument.contains("COALESCE(parent_id"))
-        );
     }
 
     #[cfg(unix)]

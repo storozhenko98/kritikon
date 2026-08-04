@@ -69,7 +69,7 @@ An unavailable or slow network never blocks the dashboard for more than three se
 | Open selected PR | `Enter` or `o` | Single-click a PR row |
 | Copy selected PR's head branch | `c` | — |
 | Copy selected PR's URL | `Shift+C` | — |
-| Open resumable OpenCode review agent | `Shift+R` | — |
+| Start/inspect resumable background OpenCode review | `Shift+R` | — |
 | Expand/collapse details | `d` or `Esc`; arrows/PgUp/PgDn scroll | Wheel/trackpad |
 | Configure refresh timer | `t` | Click editor controls |
 | Refresh now | `r` | — |
@@ -96,18 +96,19 @@ On a PR with no saved agent session:
 
 1. Press `Shift+R`.
 2. Leave the focus field blank to use Kritikon's thorough review template, or type additional instructions such as `focus on cancellation and data-loss paths`.
-3. Press `Enter`. Kritikon temporarily leaves its own screen, prepares a managed scratch checkout, and opens the real OpenCode TUI with permission auto-approval enabled.
-4. OpenCode reviews the checked-out PR and is instructed to write the proposed review body to `.kritikon/review.md` without posting anything.
-5. Chat or ask follow-up questions directly in OpenCode. When you exit OpenCode, Kritikon returns and renders the saved Markdown draft.
+3. Press `Enter`. Kritikon immediately queues the work in the background and remains responsive while it prepares the managed scratch checkout and runs OpenCode headlessly.
+4. Press `Esc` to use the rest of the dashboard while the review runs. The footer keeps the background-job count visible and marks completed drafts as ready.
+5. Press `Shift+R` on that PR to inspect progress. Once its session is ready, press `o` to attach the real OpenCode TUI if you want to watch or intervene. In OpenCode, press `Ctrl+X`, then `Q` (or run `/exit`) to detach the client and return to Kritikon without stopping the background worker.
+6. OpenCode writes the proposed review body to `.kritikon/review.md` without posting anything. Kritikon smoothly replaces the progress view with the rendered Markdown draft when the worker completes.
 
 The draft view supports:
 
 - `r` — run the standard review prompt again in the same OpenCode session.
 - `e` — add custom focus and continue the same session.
-- `o` — reopen the full OpenCode chat without automatically sending another review prompt.
+- `o` — attach the full OpenCode TUI to a running review, or reopen the saved chat after completion, without automatically sending another review prompt.
 - `p` — choose **Approve**, **Comment**, or **Request changes**, then pass a separate confirmation screen before Kritikon invokes `gh pr review`.
 
-OpenCode context is preserved by session ID per PR. Reopening the same PR—even after a later review request—continues the prior conversation. Before each launch, Kritikon refreshes its disposable checkout to the latest PR head and restores the last saved draft.
+OpenCode context is preserved by session ID per PR. Reopening the same PR—even after a later review request—continues the prior conversation. Before each run, Kritikon refreshes its disposable checkout to the latest PR head and restores the last saved draft. Active reviews use a password-protected OpenCode server bound only to `127.0.0.1`; the headless worker and optional TUI are separate clients of that server, which is why detaching the TUI does not interrupt the review.
 
 Session records and drafts use native data directories:
 
@@ -192,7 +193,7 @@ Private PR visibility exactly matches the active `gh` authentication. Team disco
 
 ## Development
 
-Debug builds include generated scenarios for testing every state without calling GitHub. They use an isolated config at `target/kritikon-dev/config.toml` and add deliberate refresh latency so background behavior is visible.
+Debug builds include generated scenarios for testing every state without calling GitHub. They use an isolated config at `target/kritikon-dev/config.toml` and add deliberate refresh latency so background behavior is visible. In any populated scenario, `Shift+R` also simulates the review worker's preparing, attachable, and completed phases without launching OpenCode or posting anything.
 
 ```bash
 cargo run -- --dev-scenario all-states --refresh-seconds 5
