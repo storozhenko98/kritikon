@@ -221,7 +221,7 @@ fn run_tui(
                     }
                 },
                 Action::OpenReview(target) => {
-                    if app.show_active_review(&target.url) {
+                    if app.show_review_for_target(&target.url) {
                         continue;
                     }
                     #[cfg(debug_assertions)]

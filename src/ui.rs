@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, ConfigFocus, ReviewPanelMode, ReviewRunPhase, RowHitbox, Tab},
+    app::{App, ConfigFocus, ReviewAgentState, ReviewPanelMode, ReviewRunPhase, RowHitbox, Tab},
     config::MIN_REFRESH_SECONDS,
     model::{
         CheckState, DisplayReviewState, MergeableState, PullRequest, ReviewState, ReviewerKind,
@@ -279,6 +279,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let y = inner.y + (visible_index as u16 * ROW_HEIGHT);
         let rect = Rect::new(inner.x, y, inner.width, ROW_HEIGHT.min(inner.bottom() - y));
         let pull_request = &items[item_index];
+        let agent_state = app.review_agent_state(&pull_request.url);
         render_row(
             frame,
             rect,
@@ -286,6 +287,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             item_index == selected,
             app.tab,
             &data.viewer,
+            agent_state,
         );
         hitboxes.push(RowHitbox {
             rect,
@@ -302,6 +304,7 @@ fn render_row(
     selected: bool,
     tab: Tab,
     viewer: &str,
+    agent_state: Option<ReviewAgentState>,
 ) {
     let row_style = if selected {
         Style::default().bg(Color::Rgb(38, 53, 58))
@@ -328,6 +331,17 @@ fn render_row(
         format!(" {} ", state.label()),
         review_display_color(state),
     ));
+    if let Some(agent_state) = agent_state {
+        let (label, color) = match agent_state {
+            ReviewAgentState::Preparing => (" AGENT PREP ", Color::Yellow),
+            ReviewAgentState::Reviewing => (" AGENT RUNNING ", ACCENT),
+            ReviewAgentState::Ready => (" AGENT READY ", Color::Green),
+            ReviewAgentState::Draft => (" AGENT DRAFT ", Color::Blue),
+            ReviewAgentState::Failed => (" AGENT FAILED ", Color::Red),
+        };
+        title.push(Span::raw(" "));
+        title.push(badge(label, color));
+    }
     title.push(Span::raw("  "));
     title.push(Span::styled(
         pull_request.title.clone(),
@@ -934,7 +948,10 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let popup = centered_rect(width, height, area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(" OpenCode PR review ")
+        .title(format!(
+            " OpenCode PR review · {}#{} ",
+            snapshot.target.repository, snapshot.target.number
+        ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT));
@@ -1216,7 +1233,15 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         Line::from(error.unwrap_or_else(|| "Unknown review-agent error".into())),
                         Line::raw(""),
                         Line::from(Span::styled(
-                            "Check `gh auth status` and `opencode --version`. Press r to reload the saved session or Esc to close.",
+                            format!(
+                                "This failure is scoped only to {}#{}; other PR reviews are unaffected.",
+                                snapshot.target.repository, snapshot.target.number
+                            ),
+                            Style::default().fg(Color::Yellow),
+                        )),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Press r to reload this PR's saved session, or Esc to return and open another PR.",
                             Style::default().fg(MUTED),
                         )),
                     ],
@@ -1856,6 +1881,49 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_agent_badge_is_scoped_to_the_exact_pull_request_row() {
+        let first = sample_pr();
+        let mut second = sample_pr();
+        second.number = 43;
+        second.url = "https://github.com/acme/app/pull/43".into();
+        second.title = "A different pull request".into();
+        let data = DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![first, second],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        };
+        let mut app = App::with_data(data);
+        app.review_started(review_snapshot(false, false));
+        app.close_review_panel();
+        let backend = TestBackend::new(140, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let lines = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let first_row = lines
+            .iter()
+            .find(|line| line.contains("acme/app#42"))
+            .unwrap();
+        let second_row = lines
+            .iter()
+            .find(|line| line.contains("acme/app#43"))
+            .unwrap();
+        assert!(first_row.contains("AGENT PREP"));
+        assert!(!second_row.contains("AGENT"));
+    }
+
+    #[test]
     fn completed_background_review_remains_visible_in_the_footer() {
         let mut app = App::with_data(DashboardData {
             viewer: "viewer".into(),
@@ -1888,5 +1956,6 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("OpenCode review ready: acme/app#42"));
         assert!(rendered.contains("Shift+R to inspect"));
+        assert!(rendered.contains("AGENT READY"));
     }
 }

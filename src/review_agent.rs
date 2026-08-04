@@ -22,6 +22,10 @@ use serde_json::{Map, Value};
 use crate::model::PullRequest;
 
 const RECORD_VERSION: u8 = 1;
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
+const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const OPENCODE_PERMISSION_CONFIG: &str = r#"{"permission":"allow"}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -805,7 +809,7 @@ fn start_server(
         control: control.clone(),
     };
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + SERVER_START_TIMEOUT;
     loop {
         if control.shutdown.load(Ordering::Acquire) {
             bail!("review stopped while the OpenCode server was starting");
@@ -825,7 +829,8 @@ fn start_server(
         }
         if Instant::now() >= deadline {
             bail!(
-                "OpenCode server did not become ready within 10 seconds. Log: {}",
+                "OpenCode server did not become ready within {} seconds. Log: {}",
+                SERVER_START_TIMEOUT.as_secs(),
                 log_path.display()
             );
         }
@@ -835,7 +840,7 @@ fn start_server(
 
 fn server_is_healthy(connection: &ServerConnection) -> bool {
     let url = format!("{}/global/health", connection.endpoint);
-    let agent = local_http_agent(Duration::from_millis(250));
+    let agent = short_local_http_agent(Duration::from_millis(250));
     let Ok(mut response) = agent
         .get(&url)
         .header("Authorization", &basic_auth_header(&connection.password))
@@ -863,13 +868,20 @@ fn create_server_session(
 ) -> Result<String> {
     let url = format!("{}/session", connection.endpoint);
     let title = format!("Kritikon: {}#{}", target.repository, target.number);
-    let agent = local_http_agent(Duration::from_secs(5));
+    let agent = session_http_agent();
     let mut response = agent
         .post(&url)
         .query("directory", workspace.to_string_lossy())
         .header("Authorization", &basic_auth_header(&connection.password))
         .send_json(serde_json::json!({ "title": title }))
-        .context("could not create an OpenCode review session")?;
+        .with_context(|| {
+            format!(
+                "could not create the OpenCode session for {}#{} after allowing up to {} seconds",
+                target.repository,
+                target.number,
+                SESSION_CREATE_TIMEOUT.as_secs()
+            )
+        })?;
     let session: CreatedSession = response
         .body_mut()
         .read_json()
@@ -880,9 +892,22 @@ fn create_server_session(
     Ok(session.id)
 }
 
-fn local_http_agent(timeout: Duration) -> ureq::Agent {
+fn short_local_http_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
+        .proxy(None)
         .timeout_global(Some(timeout))
+        .build()
+        .into()
+}
+
+fn session_http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_connect(Some(LOCAL_CONNECT_TIMEOUT))
+        .timeout_send_request(Some(LOCAL_IO_TIMEOUT))
+        .timeout_send_body(Some(LOCAL_IO_TIMEOUT))
+        .timeout_recv_response(Some(SESSION_CREATE_TIMEOUT))
+        .timeout_recv_body(Some(LOCAL_IO_TIMEOUT))
         .build()
         .into()
 }
@@ -1388,6 +1413,22 @@ mod tests {
             basic_auth_header("secret").to_ascii_lowercase()
         )));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cold_session_creation_has_no_five_second_global_deadline() {
+        let agent = session_http_agent();
+        let timeouts = agent.config().timeouts();
+
+        assert!(agent.config().proxy().is_none());
+        assert_eq!(timeouts.global, None);
+        assert_eq!(timeouts.connect, Some(LOCAL_CONNECT_TIMEOUT));
+        assert_eq!(timeouts.send_request, Some(LOCAL_IO_TIMEOUT));
+        assert_eq!(timeouts.send_body, Some(LOCAL_IO_TIMEOUT));
+        assert_eq!(timeouts.recv_response, Some(SESSION_CREATE_TIMEOUT));
+        assert_eq!(timeouts.recv_body, Some(LOCAL_IO_TIMEOUT));
+        assert!(SESSION_CREATE_TIMEOUT >= Duration::from_secs(60));
+        assert!(SERVER_START_TIMEOUT >= Duration::from_secs(30));
     }
 
     #[cfg(unix)]

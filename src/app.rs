@@ -129,6 +129,15 @@ pub enum ReviewRunPhase {
     Reviewing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewAgentState {
+    Preparing,
+    Reviewing,
+    Ready,
+    Draft,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewPanel {
     pub snapshot: ReviewSnapshot,
@@ -191,6 +200,7 @@ pub struct App {
     pub config_editor: Option<ConfigEditor>,
     pub config_hitboxes: ConfigHitboxes,
     pub review_panel: Option<ReviewPanel>,
+    review_panels: HashMap<String, ReviewPanel>,
     active_reviews: HashMap<String, ActiveReview>,
     ready_reviews: HashMap<String, String>,
     pub refresh_remaining: Duration,
@@ -227,6 +237,7 @@ impl App {
             config_editor: None,
             config_hitboxes: ConfigHitboxes::default(),
             review_panel: None,
+            review_panels: HashMap::new(),
             active_reviews: HashMap::new(),
             ready_reviews: HashMap::new(),
             refresh_remaining: Duration::ZERO,
@@ -254,20 +265,20 @@ impl App {
 
     pub fn open_config(&mut self, error: Option<String>) {
         self.show_help = false;
-        self.review_panel = None;
+        self.close_review_panel();
         self.config_editor = Some(ConfigEditor::new(self.config, error));
     }
 
     pub fn show_review_snapshot(&mut self, snapshot: ReviewSnapshot) {
-        self.ready_reviews.remove(&snapshot.target.url);
+        let target_url = snapshot.target.url.clone();
+        self.ready_reviews.remove(&target_url);
+        self.review_panels.remove(&target_url);
         let mode = if snapshot.has_session() || snapshot.has_draft() {
             ReviewPanelMode::Draft
         } else {
             ReviewPanelMode::Prompt
         };
-        self.show_help = false;
-        self.config_editor = None;
-        self.review_panel = Some(ReviewPanel {
+        self.present_review_panel(ReviewPanel {
             snapshot,
             mode,
             input: String::new(),
@@ -280,6 +291,7 @@ impl App {
     pub fn review_started(&mut self, snapshot: ReviewSnapshot) {
         let target_url = snapshot.target.url.clone();
         self.ready_reviews.remove(&target_url);
+        self.review_panels.remove(&target_url);
         self.active_reviews.insert(
             target_url,
             ActiveReview {
@@ -317,6 +329,10 @@ impl App {
         }) {
             self.show_review_snapshot(snapshot);
         } else {
+            self.review_panels.insert(
+                target_url.clone(),
+                Self::panel_for_snapshot(snapshot.clone(), ReviewPanelMode::Draft, None),
+            );
             self.ready_reviews.insert(
                 target_url,
                 format!("{}#{}", snapshot.target.repository, snapshot.target.number),
@@ -337,23 +353,32 @@ impl App {
             .as_ref()
             .is_some_and(|panel| panel.snapshot.target.url == target_url)
         {
-            self.show_review_snapshot(snapshot);
-            if let Some(panel) = &mut self.review_panel {
-                panel.mode = ReviewPanelMode::Error;
-                panel.error = Some(error);
-            }
+            self.present_review_panel(Self::panel_for_snapshot(
+                snapshot,
+                ReviewPanelMode::Error,
+                Some(error),
+            ));
         } else {
+            self.review_panels.insert(
+                target_url,
+                Self::panel_for_snapshot(snapshot, ReviewPanelMode::Error, Some(error.clone())),
+            );
             self.set_notice(format!(
                 "OpenCode review failed — Shift+R to inspect: {error}"
             ));
         }
     }
 
-    pub fn show_active_review(&mut self, target_url: &str) -> bool {
-        let Some(active) = self.active_reviews.get(target_url).cloned() else {
+    pub fn show_review_for_target(&mut self, target_url: &str) -> bool {
+        if let Some(active) = self.active_reviews.get(target_url).cloned() {
+            self.show_running_review(active.snapshot, active.phase);
+            return true;
+        }
+        let Some(panel) = self.review_panels.remove(target_url) else {
             return false;
         };
-        self.show_running_review(active.snapshot, active.phase);
+        self.ready_reviews.remove(target_url);
+        self.present_review_panel(panel);
         true
     }
 
@@ -372,6 +397,35 @@ impl App {
         self.active_reviews.len()
     }
 
+    pub fn review_agent_state(&self, target_url: &str) -> Option<ReviewAgentState> {
+        if let Some(active) = self.active_reviews.get(target_url) {
+            return Some(match active.phase {
+                ReviewRunPhase::Preparing => ReviewAgentState::Preparing,
+                ReviewRunPhase::Reviewing => ReviewAgentState::Reviewing,
+            });
+        }
+        if self.ready_reviews.contains_key(target_url) {
+            return Some(ReviewAgentState::Ready);
+        }
+        self.review_panel
+            .as_ref()
+            .filter(|panel| panel.snapshot.target.url == target_url)
+            .or_else(|| self.review_panels.get(target_url))
+            .and_then(|panel| match panel.mode {
+                ReviewPanelMode::Draft
+                | ReviewPanelMode::PostChoice
+                | ReviewPanelMode::ConfirmPost(_) => Some(ReviewAgentState::Draft),
+                ReviewPanelMode::Error => Some(ReviewAgentState::Failed),
+                ReviewPanelMode::Running(ReviewRunPhase::Preparing) => {
+                    Some(ReviewAgentState::Preparing)
+                }
+                ReviewPanelMode::Running(ReviewRunPhase::Reviewing) => {
+                    Some(ReviewAgentState::Reviewing)
+                }
+                ReviewPanelMode::Prompt => None,
+            })
+    }
+
     pub fn ready_review_labels(&self) -> Vec<&str> {
         let mut labels = self
             .ready_reviews
@@ -383,35 +437,34 @@ impl App {
     }
 
     fn show_running_review(&mut self, snapshot: ReviewSnapshot, phase: ReviewRunPhase) {
-        self.show_help = false;
-        self.config_editor = None;
-        self.review_panel = Some(ReviewPanel {
+        self.present_review_panel(Self::panel_for_snapshot(
             snapshot,
-            mode: ReviewPanelMode::Running(phase),
-            input: String::new(),
-            scroll: 0,
-            max_scroll: 0,
-            error: None,
-        });
+            ReviewPanelMode::Running(phase),
+            None,
+        ));
     }
 
     pub fn show_review_error(&mut self, target: ReviewTarget, error: impl Into<String>) {
-        self.show_review_snapshot(ReviewSnapshot {
-            target,
-            session_id: None,
-            draft: None,
-            draft_path: PathBuf::new(),
-            workspace: PathBuf::new(),
-            warning: None,
-        });
-        if let Some(panel) = &mut self.review_panel {
-            panel.mode = ReviewPanelMode::Error;
-            panel.error = Some(error.into());
-        }
+        self.present_review_panel(Self::panel_for_snapshot(
+            ReviewSnapshot {
+                target,
+                session_id: None,
+                draft: None,
+                draft_path: PathBuf::new(),
+                workspace: PathBuf::new(),
+                warning: None,
+            },
+            ReviewPanelMode::Error,
+            Some(error.into()),
+        ));
     }
 
     pub fn review_posted(&mut self, kind: ReviewKind) {
-        self.review_panel = None;
+        if let Some(panel) = self.review_panel.take() {
+            let target_url = panel.snapshot.target.url;
+            self.review_panels.remove(&target_url);
+            self.ready_reviews.remove(&target_url);
+        }
         self.set_notice(format!("Posted {} review", kind.label()));
         self.begin_refresh();
     }
@@ -420,6 +473,39 @@ impl App {
         if let Some(panel) = &mut self.review_panel {
             panel.mode = ReviewPanelMode::Error;
             panel.error = Some(error.into());
+        }
+    }
+
+    pub fn close_review_panel(&mut self) {
+        let Some(panel) = self.review_panel.take() else {
+            return;
+        };
+        if !matches!(panel.mode, ReviewPanelMode::Running(_)) {
+            self.review_panels
+                .insert(panel.snapshot.target.url.clone(), panel);
+        }
+    }
+
+    fn present_review_panel(&mut self, panel: ReviewPanel) {
+        self.close_review_panel();
+        self.review_panels.remove(&panel.snapshot.target.url);
+        self.show_help = false;
+        self.config_editor = None;
+        self.review_panel = Some(panel);
+    }
+
+    fn panel_for_snapshot(
+        snapshot: ReviewSnapshot,
+        mode: ReviewPanelMode,
+        error: Option<String>,
+    ) -> ReviewPanel {
+        ReviewPanel {
+            snapshot,
+            mode,
+            input: String::new(),
+            scroll: 0,
+            max_scroll: 0,
+            error,
         }
     }
 
@@ -886,7 +972,7 @@ impl App {
         match mode {
             ReviewPanelMode::Prompt => match key.code {
                 KeyCode::Esc => {
-                    self.review_panel = None;
+                    self.close_review_panel();
                     Action::None
                 }
                 KeyCode::Enter => {
@@ -930,7 +1016,7 @@ impl App {
             },
             ReviewPanelMode::Running(phase) => match key.code {
                 KeyCode::Esc => {
-                    self.review_panel = None;
+                    self.close_review_panel();
                     Action::None
                 }
                 KeyCode::Char('o') if phase == ReviewRunPhase::Reviewing => {
@@ -945,7 +1031,7 @@ impl App {
             },
             ReviewPanelMode::Draft => match key.code {
                 KeyCode::Esc => {
-                    self.review_panel = None;
+                    self.close_review_panel();
                     Action::None
                 }
                 KeyCode::Char('r') => {
@@ -1063,7 +1149,7 @@ impl App {
             },
             ReviewPanelMode::Error => match key.code {
                 KeyCode::Esc => {
-                    self.review_panel = None;
+                    self.close_review_panel();
                     Action::None
                 }
                 KeyCode::Char('r') => {
@@ -1573,12 +1659,16 @@ mod tests {
     }
 
     fn review_snapshot(session: bool, draft: bool) -> ReviewSnapshot {
+        review_snapshot_for(1, session, draft)
+    }
+
+    fn review_snapshot_for(number: u64, session: bool, draft: bool) -> ReviewSnapshot {
         ReviewSnapshot {
-            target: ReviewTarget::from(&pr(1)),
-            session_id: session.then(|| "ses_review".into()),
+            target: ReviewTarget::from(&pr(number)),
+            session_id: session.then(|| format!("ses_review_{number}")),
             draft: draft.then(|| "# Summary\n\nReady to review.\n".into()),
-            draft_path: PathBuf::from("/tmp/kritikon-review.md"),
-            workspace: PathBuf::from("/tmp/kritikon-review-workspace"),
+            draft_path: PathBuf::from(format!("/tmp/kritikon-review-{number}.md")),
+            workspace: PathBuf::from(format!("/tmp/kritikon-review-workspace-{number}")),
             warning: None,
         }
     }
@@ -1677,7 +1767,7 @@ mod tests {
 
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
         assert!(app.review_panel.is_none());
-        assert!(app.show_active_review(&target_url));
+        assert!(app.show_review_for_target(&target_url));
 
         let ready = review_snapshot(true, false);
         app.review_session_ready(ready.clone());
@@ -1705,6 +1795,97 @@ mod tests {
             app.review_panel.as_ref().unwrap().snapshot.draft,
             completed.draft
         );
+    }
+
+    #[test]
+    fn concurrent_review_panels_and_failures_are_scoped_to_the_exact_pull_request() {
+        let mut app = app();
+        let first = review_snapshot_for(1, false, false);
+        let second = review_snapshot_for(2, false, false);
+        let first_url = first.target.url.clone();
+        let second_url = second.target.url.clone();
+
+        app.review_started(first);
+        app.close_review_panel();
+        app.review_started(second);
+        app.close_review_panel();
+        app.review_session_ready(review_snapshot_for(1, true, false));
+
+        assert_eq!(
+            app.review_agent_state(&first_url),
+            Some(ReviewAgentState::Reviewing)
+        );
+        assert_eq!(
+            app.review_agent_state(&second_url),
+            Some(ReviewAgentState::Preparing)
+        );
+
+        assert!(app.show_review_for_target(&second_url));
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.snapshot.target.number, 2);
+        assert_eq!(
+            panel.mode,
+            ReviewPanelMode::Running(ReviewRunPhase::Preparing)
+        );
+        app.close_review_panel();
+
+        assert!(app.show_review_for_target(&first_url));
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.snapshot.target.number, 1);
+        assert_eq!(
+            panel.mode,
+            ReviewPanelMode::Running(ReviewRunPhase::Reviewing)
+        );
+
+        app.review_background_failed(
+            review_snapshot_for(2, false, false),
+            "second PR failed independently",
+        );
+        assert_eq!(app.review_panel.as_ref().unwrap().snapshot.target.number, 1);
+        assert_eq!(
+            app.review_agent_state(&second_url),
+            Some(ReviewAgentState::Failed)
+        );
+
+        app.close_review_panel();
+        assert!(app.show_review_for_target(&second_url));
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.snapshot.target.number, 2);
+        assert_eq!(panel.mode, ReviewPanelMode::Error);
+        assert_eq!(
+            panel.error.as_deref(),
+            Some("second PR failed independently")
+        );
+    }
+
+    #[test]
+    fn unfinished_review_prompts_are_preserved_per_pull_request() {
+        let mut app = app();
+        let first = review_snapshot_for(1, false, false);
+        let second = review_snapshot_for(2, false, false);
+        let first_url = first.target.url.clone();
+        let second_url = second.target.url.clone();
+
+        app.show_review_snapshot(first);
+        for character in "focus one".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.close_review_panel();
+
+        app.show_review_snapshot(second);
+        for character in "focus two".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.close_review_panel();
+
+        assert!(app.show_review_for_target(&first_url));
+        assert_eq!(app.review_panel.as_ref().unwrap().snapshot.target.number, 1);
+        assert_eq!(app.review_panel.as_ref().unwrap().input, "focus one");
+        app.close_review_panel();
+
+        assert!(app.show_review_for_target(&second_url));
+        assert_eq!(app.review_panel.as_ref().unwrap().snapshot.target.number, 2);
+        assert_eq!(app.review_panel.as_ref().unwrap().input, "focus two");
     }
 
     #[test]

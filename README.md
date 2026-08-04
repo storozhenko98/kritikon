@@ -101,6 +101,8 @@ On a PR with no saved agent session:
 5. Press `Shift+R` on that PR to inspect progress. Once its session is ready, press `o` to attach the real OpenCode TUI if you want to watch or intervene. In OpenCode, press `Ctrl+X`, then `Q` (or run `/exit`) to detach the client and return to Kritikon without stopping the background worker.
 6. OpenCode writes the proposed review body to `.kritikon/review.md` without posting anything. Kritikon smoothly replaces the progress view with the rendered Markdown draft when the worker completes.
 
+Every review panel and background job is keyed to the exact PR URL. Dashboard rows show a compact `AGENT PREP`, `AGENT RUNNING`, `AGENT READY`, `AGENT DRAFT`, or `AGENT FAILED` badge for that PR, and unfinished prompts, failures, sessions, and drafts remain independent when you move between PRs.
+
 The draft view supports:
 
 - `r` — run the standard review prompt again in the same OpenCode session.
