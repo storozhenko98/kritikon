@@ -8,7 +8,10 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, ConfigFocus, RowHitbox, Tab},
+    app::{
+        App, ConfigFocus, PlaybookEditorMode, ReviewAgentState, ReviewPanelMode, ReviewRunPhase,
+        RowHitbox, Tab,
+    },
     config::MIN_REFRESH_SECONDS,
     model::{
         CheckState, DisplayReviewState, MergeableState, PullRequest, ReviewState, ReviewerKind,
@@ -41,6 +44,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.config_editor.is_some() {
         render_config(frame, area, app);
+    }
+    if app.review_panel.is_some() {
+        render_review_panel(frame, area, app);
+    }
+    if app.playbook_editor.is_some() {
+        render_playbook_editor(frame, area, app);
     }
 }
 
@@ -276,6 +285,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let y = inner.y + (visible_index as u16 * ROW_HEIGHT);
         let rect = Rect::new(inner.x, y, inner.width, ROW_HEIGHT.min(inner.bottom() - y));
         let pull_request = &items[item_index];
+        let agent_state = app.review_agent_state(&pull_request.url);
         render_row(
             frame,
             rect,
@@ -283,6 +293,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             item_index == selected,
             app.tab,
             &data.viewer,
+            agent_state,
         );
         hitboxes.push(RowHitbox {
             rect,
@@ -299,6 +310,7 @@ fn render_row(
     selected: bool,
     tab: Tab,
     viewer: &str,
+    agent_state: Option<ReviewAgentState>,
 ) {
     let row_style = if selected {
         Style::default().bg(Color::Rgb(38, 53, 58))
@@ -325,6 +337,18 @@ fn render_row(
         format!(" {} ", state.label()),
         review_display_color(state),
     ));
+    if let Some(agent_state) = agent_state {
+        let (label, color) = match agent_state {
+            ReviewAgentState::Preparing => (" AGENT PREP ", Color::Yellow),
+            ReviewAgentState::Reviewing => (" AGENT RUNNING ", ACCENT),
+            ReviewAgentState::Ready => (" AGENT READY ", Color::Green),
+            ReviewAgentState::Draft => (" AGENT DRAFT ", Color::Blue),
+            ReviewAgentState::Session => (" AGENT SESSION ", Color::DarkGray),
+            ReviewAgentState::Failed => (" AGENT FAILED ", Color::Red),
+        };
+        title.push(Span::raw(" "));
+        title.push(badge(label, color));
+    }
     title.push(Span::raw("  "));
     title.push(Span::styled(
         pull_request.title.clone(),
@@ -720,6 +744,30 @@ fn render_compact_details(
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let status = if let Some((notice, _)) = &app.notice {
         Span::styled(notice.clone(), Style::default().fg(ACCENT))
+    } else if app.active_review_count() > 0 || !app.ready_review_labels().is_empty() {
+        let ready = app.ready_review_labels();
+        let activity = if app.active_review_count() == 0 {
+            format!("OpenCode review ready: {}", ready.join(", "))
+        } else {
+            let ready_status = if ready.is_empty() {
+                String::new()
+            } else {
+                format!(" · ready: {}", ready.join(", "))
+            };
+            format!(
+                "OpenCode: {} background review{} running{ready_status}",
+                app.active_review_count(),
+                if app.active_review_count() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        };
+        Span::styled(
+            format!("{activity} · Shift+R to inspect"),
+            Style::default().fg(Color::Yellow),
+        )
     } else if app.loading && app.data.is_some() {
         Span::styled("Refreshing…", Style::default().fg(Color::Yellow))
     } else if app.commit_loading && app.data.is_some() {
@@ -742,11 +790,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let keys = if app.details_expanded {
-        "↑↓/jk/PgUp/PgDn scroll details  Home/End jump  Enter open  c branch  Shift+C URL  d/Esc return  t timer  ? help  q quit"
+        "↑↓/jk/PgUp/PgDn scroll details  Home/End jump  Enter open  c branch  Shift+C URL  Shift+R agent  d/Esc return  ? help  q quit"
     } else if area.width >= 100 {
-        "↑↓/jk move  PgUp/PgDn  Tab/←→ views  Enter/o open  c branch  Shift+C URL  d details  t timer  r refresh  ? help  q quit"
+        "↑↓/jk move  Tab/←→ views  Enter/o open  c branch  Shift+C URL  Shift+R agent  d details  t timer  r refresh  ? help  q quit"
     } else {
-        "↑↓ move  Tab/←→ views  Enter open  c/C copy  d details  t timer  r refresh  ? help  q quit"
+        "↑↓ move  Tab views  Enter open  c/C copy  Shift+R agent  d details  t timer  r refresh  q quit"
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -801,9 +849,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )),
         Line::raw("  ↑/↓ or j/k  move     PgUp/PgDn  page     Home/End  jump"),
         Line::raw("  Tab/Shift+Tab or ←/→  switch views     Enter/o  open in browser"),
-        Line::raw("  c  copy head branch     Shift+C  copy PR URL"),
-        Line::raw("  d  expand details       t  refresh timer"),
-        Line::raw("  r  refresh     q  quit"),
+        Line::raw("  c  copy branch     Shift+C  copy URL     Shift+R  background OpenCode review"),
+        Line::raw("  d  expand details   t  refresh timer    r  refresh    q  quit"),
         Line::raw("  Mouse wheel scrolls; a single left-click on a PR opens it."),
         Line::raw(""),
         Line::from(Span::styled(
@@ -891,6 +938,1004 @@ fn review_sources_line(app: &App) -> Line<'static> {
         Span::styled("  Monitoring: ", Style::default().fg(MUTED)),
         Span::raw(sources),
     ])
+}
+
+fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(panel) = app.review_panel.as_ref() else {
+        return;
+    };
+    let mode = panel.mode;
+    let snapshot = panel.snapshot.clone();
+    let run_kind = panel.run_kind;
+    let input = panel.input.clone();
+    let applied_playbook = panel.applied_playbook.clone();
+    let error = panel.error.clone();
+    let scroll = panel.scroll;
+
+    let width = 110.min(area.width.saturating_sub(2));
+    let height = 34.min(area.height.saturating_sub(2));
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(
+            " OpenCode PR review · {}#{} ",
+            snapshot.target.repository, snapshot.target.number
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(popup).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    frame.render_widget(block, popup);
+
+    let header = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}#{}", snapshot.target.repository, snapshot.target.number),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if snapshot.has_session() {
+                    "  ·  resumable session"
+                } else {
+                    "  ·  new session"
+                },
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::from(Span::styled(
+            snapshot.target.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    match mode {
+        ReviewPanelMode::Prompt => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(6),
+                    Constraint::Length(8),
+                ])
+                .split(inner);
+            frame.render_widget(Paragraph::new(header), chunks[0]);
+            let prompt_lines = match run_kind {
+                crate::review_agent::ReviewRunKind::FollowUp => vec![
+                    Line::from(Span::styled(
+                        "Follow up on the saved review",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(
+                        "The current Markdown stays visible and safe while OpenCode revisits it in the same PR session.",
+                    ),
+                    Line::raw(
+                        "A new non-empty review replaces it only after the follow-up completes successfully.",
+                    ),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        error.unwrap_or_else(|| {
+                            "Describe the question, concern, or area OpenCode should revisit".into()
+                        }),
+                        Style::default().fg(if panel.error.is_some() {
+                            Color::Red
+                        } else {
+                            MUTED
+                        }),
+                    )),
+                ],
+                crate::review_agent::ReviewRunKind::ReReview => vec![
+                    Line::from(Span::styled(
+                        if snapshot.has_session() {
+                            "New review · keep the current session"
+                        } else {
+                            "Default review template · new OpenCode session"
+                        },
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(
+                        "Review the actual diff for correctness, regressions, security, data loss, concurrency, and missing tests.",
+                    ),
+                    Line::raw(
+                        "OpenCode runs headlessly with permission auto-approval in a managed scratch checkout while Kritikon remains usable.",
+                    ),
+                    Line::raw(
+                        "The previous draft is replaced only by Markdown produced by this new review run.",
+                    ),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        "Optional focus — type below, or leave blank for the complete template",
+                        Style::default().fg(MUTED),
+                    )),
+                ],
+                crate::review_agent::ReviewRunKind::NewSession => vec![
+                    Line::from(Span::styled(
+                        "New OpenCode session · clean review",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(
+                        "The current session link and saved draft remain untouched while you write these instructions.",
+                    ),
+                    Line::raw(
+                        "They are cleared only when you press Enter below to launch the new session.",
+                    ),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        "Optional focus — type below, or leave blank for the complete template",
+                        Style::default().fg(MUTED),
+                    )),
+                ],
+            };
+            frame.render_widget(
+                Paragraph::new(prompt_lines).wrap(Wrap { trim: true }),
+                chunks[1],
+            );
+            let (editor_title, placeholder) = match run_kind {
+                crate::review_agent::ReviewRunKind::FollowUp => {
+                    ("Follow-up instructions", "Describe what to revisit…")
+                }
+                crate::review_agent::ReviewRunKind::ReReview => (
+                    if snapshot.has_session() {
+                        "New review focus"
+                    } else {
+                        "Focus instructions"
+                    },
+                    "Add optional guidance for this review…",
+                ),
+                crate::review_agent::ReviewRunKind::NewSession => (
+                    "New-session focus",
+                    "Add optional guidance for the new session…",
+                ),
+            };
+            render_review_focus_editor(
+                frame,
+                chunks[2],
+                &input,
+                editor_title,
+                placeholder,
+                applied_playbook.as_deref(),
+            );
+        }
+        ReviewPanelMode::Running(phase) => {
+            let (status, detail, color) = match phase {
+                ReviewRunPhase::Preparing => (
+                    "PREPARING",
+                    "Refreshing the isolated PR checkout and starting a private loopback OpenCode server.",
+                    Color::Yellow,
+                ),
+                ReviewRunPhase::Reviewing => (
+                    "REVIEWING",
+                    "The agent is reviewing in the background. Its draft will appear here when complete.",
+                    ACCENT,
+                ),
+            };
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .split(inner);
+            let mut lines = [
+                header,
+                vec![
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        if snapshot.has_draft() {
+                            format!("FOLLOW-UP {status}")
+                        } else {
+                            status.into()
+                        },
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(""),
+                    Line::from(detail),
+                    Line::from(Span::styled(
+                        "Kritikon is not blocked; Esc returns to the dashboard while this keeps running.",
+                        Style::default().fg(Color::Green),
+                    )),
+                ],
+            ]
+            .concat();
+            if let Some(draft) = snapshot.draft.as_deref() {
+                lines.extend(
+                    [
+                        vec![
+                            Line::raw(""),
+                            Line::from(Span::styled(
+                                "Previous draft — preserved until a valid replacement is ready",
+                                Style::default()
+                                    .fg(Color::Blue)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            Line::raw(""),
+                        ],
+                        markdown_lines(draft),
+                    ]
+                    .concat(),
+                );
+            }
+            let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+            let line_count = paragraph.line_count(chunks[0].width) as u16;
+            let max_scroll = line_count.saturating_sub(chunks[0].height);
+            if let Some(panel) = &mut app.review_panel {
+                panel.max_scroll = max_scroll;
+                panel.scroll = panel.scroll.min(max_scroll);
+            }
+            frame.render_widget(paragraph.scroll((scroll.min(max_scroll), 0)), chunks[0]);
+            let controls = if phase == ReviewRunPhase::Reviewing {
+                "↑↓/jk scroll  ·  o attach OpenCode  ·  Ctrl+X then Q or /exit detaches  ·  Esc dashboard"
+            } else {
+                "↑↓/jk scroll  ·  attach becomes available when the session is ready  ·  Esc dashboard"
+            };
+            frame.render_widget(
+                Paragraph::new(controls).style(Style::default().fg(MUTED)),
+                chunks[1],
+            );
+        }
+        ReviewPanelMode::Draft => {
+            let has_draft = snapshot.has_draft();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(5),
+                    Constraint::Length(2),
+                ])
+                .split(inner);
+            frame.render_widget(Paragraph::new(header), chunks[0]);
+            let mut lines = snapshot
+                .draft
+                .as_deref()
+                .map(markdown_lines)
+                .unwrap_or_else(|| {
+                    vec![Line::from(Span::styled(
+                        "No saved draft yet. Press r to run the review template or e to add custom focus.",
+                        Style::default().fg(Color::Yellow),
+                    ))]
+                });
+            if let Some(warning) = snapshot.warning.as_deref() {
+                lines.insert(
+                    0,
+                    Line::from(Span::styled(
+                        format!("Warning: {warning}"),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                );
+                lines.insert(1, Line::raw(""));
+            }
+            let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+            let line_count = paragraph.line_count(chunks[1].width) as u16;
+            let max_scroll = line_count.saturating_sub(chunks[1].height);
+            if let Some(panel) = &mut app.review_panel {
+                panel.max_scroll = max_scroll;
+                panel.scroll = panel.scroll.min(max_scroll);
+            }
+            frame.render_widget(paragraph.scroll((scroll.min(max_scroll), 0)), chunks[1]);
+            let controls = if has_draft && snapshot.has_session() && chunks[2].width < 96 {
+                vec![
+                    Line::raw("f follow up  ·  e new review  ·  r re-review"),
+                    Line::raw("n new session  ·  o chat  ·  p post  ·  Esc close  ·  ↑↓ scroll"),
+                ]
+            } else if has_draft && snapshot.has_session() {
+                vec![Line::raw(
+                    "↑↓/jk scroll  ·  f follow up  ·  e new review  ·  r re-review  ·  n new session  ·  o chat  ·  p post  ·  Esc close",
+                )]
+            } else if has_draft {
+                vec![Line::raw(
+                    "↑↓/jk scroll  ·  r new review  ·  e custom focus  ·  p post  ·  Esc close",
+                )]
+            } else {
+                vec![Line::raw(
+                    "↑↓/jk scroll  ·  r rerun  ·  e custom focus  ·  n new session  ·  o resume chat  ·  Esc close",
+                )]
+            };
+            frame.render_widget(
+                Paragraph::new(controls).style(Style::default().fg(MUTED)),
+                chunks[2],
+            );
+        }
+        ReviewPanelMode::ConfirmNewSession => {
+            frame.render_widget(
+                Paragraph::new([
+                    header,
+                    vec![
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Start a completely new OpenCode session?",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::raw(""),
+                        Line::raw(
+                            "This forgets Kritikon's link to the current OpenCode conversation and clears the saved draft.",
+                        ),
+                        Line::raw(
+                            "Use re-review instead if you want a clean draft while keeping the current session context.",
+                        ),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "y / Enter  continue to optional focus  ·  n / Esc  keep current session and draft",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        )),
+                    ],
+                ]
+                .concat())
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+        ReviewPanelMode::PostChoice => {
+            frame.render_widget(
+                Paragraph::new(
+                    [
+                        header,
+                        vec![
+                            Line::raw(""),
+                            Line::from(Span::styled(
+                                "Choose the GitHub review action",
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            )),
+                            Line::raw(""),
+                            Line::raw("  a  Approve"),
+                            Line::raw("  c  Comment without approval or change request"),
+                            Line::raw("  x  Request changes"),
+                            Line::raw(""),
+                            Line::from(Span::styled(
+                                "Nothing is posted until the separate confirmation screen.",
+                                Style::default().fg(Color::Yellow),
+                            )),
+                            Line::raw(""),
+                            Line::from(Span::styled(
+                                "Esc  back to draft",
+                                Style::default().fg(MUTED),
+                            )),
+                        ],
+                    ]
+                    .concat(),
+                )
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+        ReviewPanelMode::ConfirmPost(kind) => {
+            frame.render_widget(
+                Paragraph::new([
+                    header,
+                    vec![
+                        Line::raw(""),
+                        Line::from(vec![
+                            Span::raw("Post this draft as "),
+                            Span::styled(
+                                kind.label(),
+                                Style::default()
+                                    .fg(match kind {
+                                        crate::review_agent::ReviewKind::Approve => Color::Green,
+                                        crate::review_agent::ReviewKind::Comment => Color::Blue,
+                                        crate::review_agent::ReviewKind::RequestChanges => Color::Red,
+                                    })
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("?"),
+                        ]),
+                        Line::raw(""),
+                        Line::from(snapshot.target.url.clone()),
+                        Line::from(Span::styled(
+                            format!("Draft: {}", snapshot.draft_path.display()),
+                            Style::default().fg(MUTED),
+                        )),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "This performs a real GitHub review action as your authenticated gh account.",
+                            Style::default().fg(Color::Yellow),
+                        )),
+                        Line::raw(""),
+                        Line::from(vec![
+                            Span::styled(
+                                "y / Enter  post now",
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("    "),
+                            Span::styled("n / Esc  cancel", Style::default().fg(MUTED)),
+                        ]),
+                    ],
+                ]
+                .concat())
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+        ReviewPanelMode::Error => {
+            frame.render_widget(
+                Paragraph::new([
+                    header,
+                    vec![
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Review agent could not continue",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::raw(""),
+                        Line::from(error.unwrap_or_else(|| "Unknown review-agent error".into())),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            format!(
+                                "This failure is scoped only to {}#{}; other PR reviews are unaffected.",
+                                snapshot.target.repository, snapshot.target.number
+                            ),
+                            Style::default().fg(Color::Yellow),
+                        )),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Press r to reload this PR's saved session, or Esc to return and open another PR.",
+                            Style::default().fg(MUTED),
+                        )),
+                    ],
+                ]
+                .concat())
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+    }
+}
+
+fn render_review_focus_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input: &str,
+    base_title: &str,
+    placeholder: &str,
+    applied_playbook: Option<&str>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(rows[0]);
+
+    let editor_text = if input.is_empty() {
+        Text::from(Line::from(vec![
+            Span::styled("▌", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!(" {placeholder}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    } else {
+        Text::from(format!("{input}▌"))
+    };
+    let editor = Paragraph::new(editor_text).wrap(Wrap { trim: false });
+    let line_count = editor.line_count(columns[1].width).max(1) as u16;
+    let visible_lines = columns[1].height.max(1);
+    let scroll = line_count.saturating_sub(visible_lines);
+    let character_count = input.chars().count();
+    let base_title = applied_playbook
+        .map(|playbook| format!("{base_title} · {playbook}"))
+        .unwrap_or_else(|| base_title.to_string());
+    let title = if input.is_empty() {
+        format!(" {base_title} ")
+    } else if scroll > 0 {
+        format!(
+            " {base_title} · {character_count} chars · latest {visible_lines}/{line_count} lines "
+        )
+    } else {
+        format!(" {base_title} · {character_count} chars ")
+    };
+
+    frame.render_widget(block.title(title), area);
+    if columns[0].height > 0 {
+        if scroll > 0 {
+            frame.render_widget(
+                Paragraph::new("↑").style(Style::default().fg(MUTED)),
+                Rect::new(columns[0].x, columns[0].y, columns[0].width, 1),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new("›").style(Style::default().fg(ACCENT)),
+            Rect::new(
+                columns[0].x,
+                columns[0].bottom().saturating_sub(1),
+                columns[0].width,
+                1,
+            ),
+        );
+    }
+    frame.render_widget(editor.scroll((scroll, 0)), columns[1]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Enter", Style::default().fg(ACCENT)),
+                Span::styled(" run in background", Style::default().fg(MUTED)),
+                Span::styled("  ·  Ctrl+P", Style::default().fg(ACCENT)),
+                Span::styled(" playbooks", Style::default().fg(MUTED)),
+                Span::styled("  ·  Ctrl+S", Style::default().fg(ACCENT)),
+                Span::styled(" save", Style::default().fg(MUTED)),
+            ]),
+            Line::from(Span::styled(
+                "Backspace edit  ·  Delete clear  ·  Esc cancel",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .alignment(Alignment::Center),
+        rows[1],
+    );
+}
+
+fn markdown_lines(source: &str) -> Vec<Line<'static>> {
+    let mut in_code_block = false;
+    source
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                in_code_block = !in_code_block;
+                return Line::from(Span::styled(line.to_string(), Style::default().fg(MUTED)));
+            }
+            if in_code_block {
+                return Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            if trimmed.starts_with('#') {
+                return Line::from(Span::styled(
+                    trimmed.trim_start_matches('#').trim().to_string(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+            }
+            let color = if trimmed.contains("BLOCKING") {
+                Color::Red
+            } else if trimmed.contains("IMPORTANT") {
+                Color::Yellow
+            } else if trimmed.contains("SUGGESTION") {
+                Color::Blue
+            } else {
+                Color::Reset
+            };
+            Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
+        })
+        .collect()
+}
+
+fn render_playbook_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(editor) = app.playbook_editor.clone() else {
+        return;
+    };
+    let catalog = app.playbook_catalog();
+    app.playbook_hitboxes = Default::default();
+    let width = 96.min(area.width.saturating_sub(2));
+    let height = 32.min(area.height.saturating_sub(2));
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Review playbooks ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(popup).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    frame.render_widget(block, popup);
+
+    if editor.mode == PlaybookEditorMode::ConfirmDelete {
+        let selected = catalog.get(editor.selected);
+        let lines = vec![
+            Line::from(Span::styled(
+                "Delete this custom playbook?",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(
+                selected.map_or("Unknown playbook", |playbook| playbook.name.as_str()),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::raw("The playbook file is updated only after you confirm."),
+            Line::raw("This does not change the text already loaded into the current review."),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "y / Enter delete  ·  n / Esc keep it",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(Block::default().padding(ratatui::widgets::Padding::new(2, 2, 2, 1))),
+            inner,
+        );
+        app.playbook_hitboxes.primary = Rect::new(
+            inner.x,
+            inner.bottom().saturating_sub(4),
+            inner.width / 2,
+            3,
+        );
+        app.playbook_hitboxes.back = Rect::new(
+            inner.x + inner.width / 2,
+            inner.bottom().saturating_sub(4),
+            inner.width - inner.width / 2,
+            3,
+        );
+        let buttons = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(Rect::new(
+                inner.x,
+                inner.bottom().saturating_sub(4),
+                inner.width,
+                3,
+            ));
+        render_config_button(frame, buttons[0], "Delete", true, Color::Red);
+        render_config_button(frame, buttons[1], "Keep", false, MUTED);
+        return;
+    }
+
+    match editor.mode {
+        PlaybookEditorMode::Library => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(10),
+                    Constraint::Length(2),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Reusable review focus, without weakening Kritikon's protected base prompt.",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "Enter or click Use loads an editable copy; it never starts a review by itself.",
+                        Style::default().fg(MUTED),
+                    )),
+                ]),
+                rows[0],
+            );
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+                .split(rows[1]);
+            let list_inner = Block::default()
+                .title(format!(
+                    " {} built-in · {} custom ",
+                    catalog.iter().filter(|playbook| playbook.built_in).count(),
+                    catalog.iter().filter(|playbook| !playbook.built_in).count()
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .inner(columns[0])
+                .inner(Margin {
+                    horizontal: 1,
+                    vertical: 0,
+                });
+            frame.render_widget(
+                Block::default()
+                    .title(format!(
+                        " {} built-in · {} custom ",
+                        catalog.iter().filter(|playbook| playbook.built_in).count(),
+                        catalog.iter().filter(|playbook| !playbook.built_in).count()
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+                columns[0],
+            );
+            let visible = usize::from(list_inner.height / 2).max(1);
+            let start = editor
+                .selected
+                .saturating_add(1)
+                .saturating_sub(visible)
+                .min(catalog.len().saturating_sub(visible));
+            for (visible_index, (index, playbook)) in catalog
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+                .enumerate()
+            {
+                let rect = Rect::new(
+                    list_inner.x,
+                    list_inner.y + visible_index as u16 * 2,
+                    list_inner.width,
+                    2.min(list_inner.height.saturating_sub(visible_index as u16 * 2)),
+                );
+                app.playbook_hitboxes.rows.push(RowHitbox { rect, index });
+                let selected = index == editor.selected;
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(vec![
+                            Span::styled(
+                                if selected { "› " } else { "  " },
+                                Style::default().fg(ACCENT),
+                            ),
+                            Span::styled(
+                                playbook.name.clone(),
+                                Style::default().add_modifier(if selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                            ),
+                        ]),
+                        Line::from(Span::styled(
+                            if playbook.built_in {
+                                "  BUILT-IN"
+                            } else {
+                                "  CUSTOM"
+                            },
+                            Style::default().fg(if playbook.built_in {
+                                Color::Blue
+                            } else {
+                                Color::Green
+                            }),
+                        )),
+                    ])
+                    .style(if selected {
+                        Style::default().bg(Color::Rgb(34, 50, 54))
+                    } else {
+                        Style::default()
+                    }),
+                    rect,
+                );
+            }
+
+            let selected = catalog.get(editor.selected);
+            let preview = selected
+                .map(|playbook| {
+                    vec![
+                        Line::from(Span::styled(
+                            playbook.name.clone(),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::raw(""),
+                        Line::from(playbook.prompt.clone()),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Applied after Kritikon's mandatory review and safety instructions.",
+                            Style::default().fg(MUTED),
+                        )),
+                    ]
+                })
+                .unwrap_or_default();
+            frame.render_widget(
+                Paragraph::new(preview).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .title(" Selected instructions ")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .padding(ratatui::widgets::Padding::horizontal(1)),
+                ),
+                columns[1],
+            );
+
+            let message = editor
+                .error
+                .as_deref()
+                .or(app.playbook_warning.as_deref())
+                .unwrap_or("Built-ins are read-only. Editing one creates a custom copy.");
+            let message_color = if editor.error.is_some() || app.playbook_warning.is_some() {
+                Color::Yellow
+            } else {
+                MUTED
+            };
+            frame.render_widget(
+                Paragraph::new(message)
+                    .style(Style::default().fg(message_color))
+                    .wrap(Wrap { trim: true }),
+                rows[2],
+            );
+
+            let buttons = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                ])
+                .split(rows[3]);
+            app.playbook_hitboxes.primary = buttons[0];
+            app.playbook_hitboxes.new = buttons[1];
+            app.playbook_hitboxes.edit = buttons[2];
+            app.playbook_hitboxes.delete = buttons[3];
+            app.playbook_hitboxes.back = buttons[4];
+            render_config_button(frame, buttons[0], "Use", true, ACCENT);
+            render_config_button(frame, buttons[1], "New", false, Color::Green);
+            render_config_button(frame, buttons[2], "Edit / copy", false, Color::Blue);
+            render_config_button(frame, buttons[3], "Delete", false, Color::Red);
+            render_config_button(frame, buttons[4], "Back", false, MUTED);
+            frame.render_widget(
+                Paragraph::new(
+                    "↑↓/jk select · Enter use · n new · e edit/copy · d delete · Esc back · mouse supported",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED)),
+                rows[4],
+            );
+        }
+        PlaybookEditorMode::Name => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(5),
+                    Constraint::Length(3),
+                    Constraint::Min(2),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        if editor.original_custom_name.is_some() {
+                            "Rename the custom review playbook"
+                        } else {
+                            "Name the custom review playbook"
+                        },
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(""),
+                    Line::raw("Names are unique and may contain up to 48 characters."),
+                    Line::from(Span::styled(
+                        "Enter continues to the multiline instructions editor; nothing is saved yet.",
+                        Style::default().fg(MUTED),
+                    )),
+                ]),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(format!("{}▌", editor.name_input)).block(
+                    Block::default()
+                        .title(" Playbook name ")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(ACCENT)),
+                ),
+                rows[1],
+            );
+            if let Some(error) = &editor.error {
+                frame.render_widget(
+                    Paragraph::new(error.clone())
+                        .style(Style::default().fg(Color::Red))
+                        .wrap(Wrap { trim: true }),
+                    rows[2],
+                );
+            }
+            let buttons = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(rows[3]);
+            app.playbook_hitboxes.primary = buttons[0];
+            app.playbook_hitboxes.back = buttons[1];
+            render_config_button(frame, buttons[0], "Continue", true, ACCENT);
+            render_config_button(frame, buttons[1], "Back", false, MUTED);
+            frame.render_widget(
+                Paragraph::new(
+                    "Type name · Enter continue · Backspace edit · Delete clear · Esc back",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED)),
+                rows[4],
+            );
+        }
+        PlaybookEditorMode::Body => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(10),
+                    Constraint::Length(2),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        format!("Edit instructions · {}", editor.name_input),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "These instructions augment the protected base prompt and remain editable when selected.",
+                        Style::default().fg(MUTED),
+                    )),
+                ]),
+                rows[0],
+            );
+            render_multiline_editor(
+                frame,
+                rows[1],
+                &editor.prompt_input,
+                " Playbook instructions ",
+                "Describe the reusable review focus…",
+            );
+            if let Some(error) = &editor.error {
+                frame.render_widget(
+                    Paragraph::new(error.clone())
+                        .style(Style::default().fg(Color::Red))
+                        .wrap(Wrap { trim: true }),
+                    rows[2],
+                );
+            } else {
+                frame.render_widget(
+                    Paragraph::new("Up to 8,000 characters · Enter inserts a new line")
+                        .style(Style::default().fg(MUTED)),
+                    rows[2],
+                );
+            }
+            let buttons = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(rows[3]);
+            app.playbook_hitboxes.primary = buttons[0];
+            app.playbook_hitboxes.back = buttons[1];
+            render_config_button(frame, buttons[0], "Save playbook", true, Color::Green);
+            render_config_button(frame, buttons[1], "Discard edits", false, MUTED);
+            frame.render_widget(
+                Paragraph::new(
+                    "Ctrl+S save · Enter newline · Backspace edit · Delete clear · Esc discard",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED)),
+                rows[4],
+            );
+        }
+        PlaybookEditorMode::ConfirmDelete => unreachable!(),
+    }
+}
+
+fn render_multiline_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input: &str,
+    title: &str,
+    placeholder: &str,
+) {
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let text = if input.is_empty() {
+        Text::from(Line::from(vec![
+            Span::styled("▌", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!(" {placeholder}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    } else {
+        Text::from(format!("{input}▌"))
+    };
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let line_count = paragraph.line_count(inner.width).max(1) as u16;
+    let scroll = line_count.saturating_sub(inner.height.max(1));
+    frame.render_widget(block, area);
+    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
 }
 
 fn render_config(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -1132,6 +2177,8 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use chrono::Utc;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -1141,6 +2188,7 @@ mod tests {
             DashboardData, InvolvementReason, MergeableState, PullRequest, Review, ReviewDecision,
             ReviewRequest, ReviewState, ReviewerKind,
         },
+        review_agent::{ReviewSnapshot, ReviewTarget},
     };
 
     use super::*;
@@ -1178,6 +2226,20 @@ mod tests {
             checks: Some(CheckState::Failure),
             requested_via: vec!["@viewer".into()],
             involvement: vec![InvolvementReason::Committed, InvolvementReason::Commented],
+        }
+    }
+
+    fn review_snapshot(session: bool, draft: bool) -> ReviewSnapshot {
+        ReviewSnapshot {
+            target: ReviewTarget::from(&sample_pr()),
+            session_id: session.then(|| "ses_review".into()),
+            draft: draft.then(|| {
+                "# Summary\n\nA careful review.\n\n# Findings\n\n- **BLOCKING** `src/main.rs:42` — Example issue.\n\n# Recommended decision\n\nREQUEST_CHANGES\n"
+                    .into()
+            }),
+            draft_path: PathBuf::from("/tmp/kritikon/review.md"),
+            workspace: PathBuf::from("/tmp/kritikon/workspace"),
+            warning: None,
         }
     }
 
@@ -1345,6 +2407,560 @@ mod tests {
         assert!(rendered.contains("acme/core"));
         assert!(rendered.contains("acme/platform"));
         assert!(rendered.contains("refreshes incrementally"));
-        assert!(rendered.contains("Shift+C  copy PR URL"));
+        assert!(rendered.contains("Shift+C  copy URL"));
+        assert!(rendered.contains("Shift+R  background OpenCode review"));
+    }
+
+    #[test]
+    fn review_prompt_explains_the_template_permissions_and_saved_session() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(false, false));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("OpenCode PR review"));
+        assert!(rendered.contains("Default review template"));
+        assert!(rendered.contains("permission auto-approval"));
+        assert!(rendered.contains("Optional focus"));
+        assert!(rendered.contains("Enter run in background"));
+        assert!(rendered.contains("Ctrl+P playbooks"));
+        assert!(rendered.contains("Ctrl+S save"));
+    }
+
+    #[test]
+    fn playbook_library_renders_builtins_customs_and_mouse_selection() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.set_custom_playbooks(
+            vec![
+                crate::playbook::ReviewPlaybook::custom(
+                    "Release safety",
+                    "Check flags, rollback behavior, and mixed-version deployment.",
+                )
+                .unwrap(),
+            ],
+            None,
+        );
+        app.show_review_snapshot(review_snapshot(false, false));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Review playbooks"));
+        assert!(rendered.contains("4 built-in · 1 custom"));
+        assert!(rendered.contains("Security & authorization"));
+        assert!(rendered.contains("Release safety"));
+        assert!(rendered.contains("protected base prompt"));
+        assert!(rendered.contains("Enter use"));
+        assert_eq!(app.playbook_hitboxes.rows.len(), 5);
+
+        let custom_row = app
+            .playbook_hitboxes
+            .rows
+            .iter()
+            .find(|hitbox| hitbox.index == 4)
+            .unwrap()
+            .rect;
+        assert_eq!(
+            app.handle_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                column: custom_row.x,
+                row: custom_row.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }),
+            crate::app::Action::None
+        );
+        let use_button = app.playbook_hitboxes.primary;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: use_button.x,
+            row: use_button.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(app.playbook_editor.is_none());
+        assert_eq!(
+            app.review_panel
+                .as_ref()
+                .unwrap()
+                .applied_playbook
+                .as_deref(),
+            Some("Release safety")
+        );
+    }
+
+    #[test]
+    fn playbook_creation_explains_naming_multiline_editing_and_safe_storage() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(false, false));
+        app.review_panel.as_mut().unwrap().input = "Check rollout safety.".into();
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let naming = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(naming.contains("Name the custom review playbook"));
+        assert!(naming.contains("nothing is saved yet"));
+        assert!(naming.contains("Continue"));
+
+        for character in "Deploy safety".chars() {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let body = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("Edit instructions · Deploy safety"));
+        assert!(body.contains("Check rollout safety."));
+        assert!(body.contains("protected base prompt"));
+        assert!(body.contains("Ctrl+S save"));
+        assert!(body.contains("Enter newline"));
+    }
+
+    #[test]
+    fn long_review_focus_wraps_and_keeps_the_latest_text_and_cursor_visible() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(false, false));
+        app.review_panel.as_mut().unwrap().input = format!(
+            "BEGINNING {} END-CURSOR-VISIBLE",
+            "check cancellation, concurrency, and data-loss behavior carefully. ".repeat(24)
+        );
+        let backend = TestBackend::new(70, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Focus instructions"));
+        assert!(rendered.contains("latest"));
+        assert!(rendered.contains("END-CURSOR-VISIBLE"));
+        assert!(rendered.contains('▌'));
+        assert!(rendered.contains('↑'));
+        assert!(!rendered.contains("BEGINNING"));
+    }
+
+    #[test]
+    fn saved_review_renders_markdown_and_explicit_post_confirmation() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(true, true));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("A careful review."));
+        assert!(rendered.contains("BLOCKING"));
+        assert!(rendered.contains("f follow up"));
+        assert!(rendered.contains("n new session"));
+        assert!(rendered.contains("p post"));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Post this draft as REQUEST CHANGES?"));
+        assert!(rendered.contains("performs a real GitHub review action"));
+        assert!(rendered.contains("y / Enter  post now"));
+    }
+
+    #[test]
+    fn saved_review_controls_stay_complete_on_a_narrow_terminal() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(true, true));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("f follow up"));
+        assert!(rendered.contains("e new review"));
+        assert!(rendered.contains("r re-review"));
+        assert!(rendered.contains("n new session"));
+        assert!(rendered.contains("o chat"));
+        assert!(rendered.contains("p post"));
+        assert!(rendered.contains("Esc close"));
+    }
+
+    #[test]
+    fn running_review_explains_background_and_detach_behavior() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.review_started(review_snapshot(false, false));
+        app.review_session_ready(review_snapshot(true, false));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("REVIEWING"));
+        assert!(rendered.contains("Kritikon is not blocked"));
+        assert!(rendered.contains("attach OpenCode"));
+        assert!(rendered.contains("Ctrl+X then Q or /exit detaches"));
+    }
+
+    #[test]
+    fn follow_up_keeps_the_previous_review_visible_and_new_session_is_explicit() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        let snapshot = review_snapshot(true, true);
+        app.show_review_snapshot(snapshot.clone());
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let follow_up_prompt = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(follow_up_prompt.contains("Follow up on the saved review"));
+        assert!(follow_up_prompt.contains("current Markdown stays visible and safe"));
+        assert!(follow_up_prompt.contains("Describe the question"));
+        assert!(follow_up_prompt.contains("Follow-up instructions"));
+        assert!(follow_up_prompt.contains("Describe what to revisit"));
+
+        app.review_started(snapshot.clone());
+        app.review_session_ready(snapshot.clone());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let running = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(running.contains("FOLLOW-UP REVIEWING"));
+        assert!(running.contains("Previous draft"));
+        assert!(running.contains("A careful review."));
+
+        app.review_completed(snapshot);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let confirmation = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(confirmation.contains("completely new OpenCode session"));
+        assert!(confirmation.contains("clears the saved draft"));
+        assert!(confirmation.contains("keep current session and draft"));
+        assert!(confirmation.contains("continue to optional focus"));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let new_session_prompt = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(new_session_prompt.contains("New OpenCode session"));
+        assert!(new_session_prompt.contains("remain untouched while you write"));
+        assert!(new_session_prompt.contains("New-session focus"));
+        assert!(new_session_prompt.contains("Add optional guidance for the new session"));
+    }
+
+    #[test]
+    fn dashboard_agent_badge_is_scoped_to_the_exact_pull_request_row() {
+        let first = sample_pr();
+        let mut second = sample_pr();
+        second.number = 43;
+        second.url = "https://github.com/acme/app/pull/43".into();
+        second.title = "A different pull request".into();
+        let data = DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![first, second],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        };
+        let mut app = App::with_data(data);
+        app.review_started(review_snapshot(false, false));
+        app.close_review_panel();
+        let backend = TestBackend::new(140, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let lines = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let first_row = lines
+            .iter()
+            .find(|line| line.contains("acme/app#42"))
+            .unwrap();
+        let second_row = lines
+            .iter()
+            .find(|line| line.contains("acme/app#43"))
+            .unwrap();
+        assert!(first_row.contains("AGENT PREP"));
+        assert!(!second_row.contains("AGENT"));
+    }
+
+    #[test]
+    fn completed_session_without_markdown_has_session_badge_not_draft_badge() {
+        let data = DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        };
+        let mut app = App::with_data(data);
+        app.review_started(review_snapshot(false, false));
+        app.close_review_panel();
+        app.review_completed(review_snapshot(true, false));
+        app.notice = None;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("AGENT SESSION"));
+        assert!(!rendered.contains("AGENT DRAFT"));
+        assert!(!rendered.contains("AGENT READY"));
+        assert!(!rendered.contains("OpenCode review ready:"));
+
+        assert!(app.show_review_for_target("https://github.com/acme/app/pull/42"));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let panel = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(panel.contains("No saved draft yet"));
+        assert!(panel.contains("r rerun"));
+        assert!(panel.contains("o resume chat"));
+        assert!(!panel.contains("p post"));
+    }
+
+    #[test]
+    fn completed_background_review_remains_visible_in_the_footer() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.review_started(review_snapshot(false, false));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.review_completed(review_snapshot(true, true));
+        app.notice = None;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("OpenCode review ready: acme/app#42"));
+        assert!(rendered.contains("Shift+R to inspect"));
+        assert!(rendered.contains("AGENT READY"));
     }
 }

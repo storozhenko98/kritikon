@@ -179,7 +179,7 @@ enum LegacyReviewScope {
 }
 
 #[cfg(unix)]
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut file = fs::OpenOptions::new()
@@ -196,7 +196,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_private_file(_path: &Path, _contents: &[u8]) -> Result<()> {
+pub(crate) fn write_private_file(_path: &Path, _contents: &[u8]) -> Result<()> {
     bail!("Kritikon supports configuration on macOS and Linux only")
 }
 

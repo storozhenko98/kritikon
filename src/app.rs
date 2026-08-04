@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -12,6 +13,8 @@ use crate::{
     config::{Config, parse_refresh_seconds},
     github,
     model::{DashboardData, InvolvementReason, PullRequest},
+    playbook::{self, ReviewPlaybook},
+    review_agent::{LaunchMode, ReviewKind, ReviewRunKind, ReviewSnapshot, ReviewTarget},
 };
 #[cfg(debug_assertions)]
 use crate::{dev, dev::DevScenario};
@@ -64,6 +67,18 @@ pub enum Action {
     Open(String),
     CopyBranch(String),
     CopyUrl(String),
+    OpenReview(ReviewTarget),
+    LaunchReview {
+        target: ReviewTarget,
+        mode: LaunchMode,
+        focus: Option<String>,
+    },
+    PostReview(ReviewSnapshot, ReviewKind),
+    SavePlaybooks {
+        playbooks: Vec<ReviewPlaybook>,
+        selected_name: Option<String>,
+        notice: String,
+    },
     SaveConfig(Config),
     ResetConfig,
 }
@@ -104,6 +119,82 @@ pub struct ConfigEditor {
     pub confirm_reset: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewPanelMode {
+    Prompt,
+    Running(ReviewRunPhase),
+    Draft,
+    ConfirmNewSession,
+    PostChoice,
+    ConfirmPost(ReviewKind),
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRunPhase {
+    Preparing,
+    Reviewing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewAgentState {
+    Preparing,
+    Reviewing,
+    Ready,
+    Draft,
+    Session,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewPanel {
+    pub snapshot: ReviewSnapshot,
+    pub mode: ReviewPanelMode,
+    pub run_kind: ReviewRunKind,
+    pub input: String,
+    pub applied_playbook: Option<String>,
+    pub scroll: u16,
+    pub max_scroll: u16,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybookEditorMode {
+    Library,
+    Name,
+    Body,
+    ConfirmDelete,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaybookEditor {
+    pub mode: PlaybookEditorMode,
+    pub selected: usize,
+    pub name_input: String,
+    pub prompt_input: String,
+    pub original_custom_name: Option<String>,
+    pub error: Option<String>,
+}
+
+impl PlaybookEditor {
+    fn library(selected: usize) -> Self {
+        Self {
+            mode: PlaybookEditorMode::Library,
+            selected,
+            name_input: String::new(),
+            prompt_input: String::new(),
+            original_custom_name: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveReview {
+    snapshot: ReviewSnapshot,
+    phase: ReviewRunPhase,
+}
+
 impl ConfigEditor {
     fn new(config: Config, error: Option<String>) -> Self {
         Self {
@@ -129,6 +220,16 @@ pub struct ConfigHitboxes {
     pub cancel: Rect,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PlaybookHitboxes {
+    pub rows: Vec<RowHitbox>,
+    pub primary: Rect,
+    pub new: Rect,
+    pub edit: Rect,
+    pub delete: Rect,
+    pub back: Rect,
+}
+
 pub struct App {
     pub data: Option<DashboardData>,
     pub tab: Tab,
@@ -149,6 +250,14 @@ pub struct App {
     pub config_path: PathBuf,
     pub config_editor: Option<ConfigEditor>,
     pub config_hitboxes: ConfigHitboxes,
+    pub review_panel: Option<ReviewPanel>,
+    pub playbook_editor: Option<PlaybookEditor>,
+    pub playbook_hitboxes: PlaybookHitboxes,
+    pub playbook_warning: Option<String>,
+    custom_playbooks: Vec<ReviewPlaybook>,
+    review_panels: HashMap<String, ReviewPanel>,
+    active_reviews: HashMap<String, ActiveReview>,
+    ready_reviews: HashMap<String, String>,
     pub refresh_remaining: Duration,
     pub data_source: DataSource,
     refresh_receiver: Option<Receiver<RefreshMessage>>,
@@ -182,6 +291,14 @@ impl App {
             config_path,
             config_editor: None,
             config_hitboxes: ConfigHitboxes::default(),
+            review_panel: None,
+            playbook_editor: None,
+            playbook_hitboxes: PlaybookHitboxes::default(),
+            playbook_warning: None,
+            custom_playbooks: Vec::new(),
+            review_panels: HashMap::new(),
+            active_reviews: HashMap::new(),
+            ready_reviews: HashMap::new(),
             refresh_remaining: Duration::ZERO,
             data_source,
             refresh_receiver: None,
@@ -207,7 +324,337 @@ impl App {
 
     pub fn open_config(&mut self, error: Option<String>) {
         self.show_help = false;
+        self.close_review_panel();
         self.config_editor = Some(ConfigEditor::new(self.config, error));
+    }
+
+    pub fn set_custom_playbooks(
+        &mut self,
+        playbooks: Vec<ReviewPlaybook>,
+        warning: Option<String>,
+    ) {
+        self.custom_playbooks = playbooks;
+        self.playbook_warning = warning;
+    }
+
+    pub fn playbook_catalog(&self) -> Vec<ReviewPlaybook> {
+        playbook::catalog(&self.custom_playbooks)
+    }
+
+    pub fn playbooks_saved(
+        &mut self,
+        playbooks: Vec<ReviewPlaybook>,
+        selected_name: Option<String>,
+        notice: String,
+    ) {
+        self.custom_playbooks = playbooks;
+        self.playbook_warning = None;
+        let catalog = self.playbook_catalog();
+        if let Some(editor) = &mut self.playbook_editor {
+            editor.mode = PlaybookEditorMode::Library;
+            editor.selected = selected_name
+                .as_deref()
+                .and_then(|selected| {
+                    catalog
+                        .iter()
+                        .position(|playbook| playbook.name.eq_ignore_ascii_case(selected))
+                })
+                .unwrap_or_else(|| editor.selected.min(catalog.len().saturating_sub(1)));
+            editor.name_input.clear();
+            editor.prompt_input.clear();
+            editor.original_custom_name = None;
+            editor.error = None;
+        }
+        self.set_notice(notice);
+    }
+
+    pub fn playbook_write_failed(&mut self, error: impl Into<String>) {
+        if let Some(editor) = &mut self.playbook_editor {
+            editor.error = Some(error.into());
+        }
+    }
+
+    pub fn show_review_snapshot(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        self.ready_reviews.remove(&target_url);
+        self.review_panels.remove(&target_url);
+        let mode = if snapshot.has_session() || snapshot.has_draft() {
+            ReviewPanelMode::Draft
+        } else {
+            ReviewPanelMode::Prompt
+        };
+        self.present_review_panel(ReviewPanel {
+            snapshot,
+            mode,
+            run_kind: ReviewRunKind::ReReview,
+            input: String::new(),
+            applied_playbook: None,
+            scroll: 0,
+            max_scroll: 0,
+            error: None,
+        });
+    }
+
+    pub fn review_started(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        self.ready_reviews.remove(&target_url);
+        self.review_panels.remove(&target_url);
+        self.active_reviews.insert(
+            target_url,
+            ActiveReview {
+                snapshot: snapshot.clone(),
+                phase: ReviewRunPhase::Preparing,
+            },
+        );
+        self.show_running_review(snapshot, ReviewRunPhase::Preparing);
+    }
+
+    pub fn review_session_ready(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        self.active_reviews.insert(
+            target_url.clone(),
+            ActiveReview {
+                snapshot: snapshot.clone(),
+                phase: ReviewRunPhase::Reviewing,
+            },
+        );
+        if self
+            .review_panel
+            .as_ref()
+            .is_some_and(|panel| panel.snapshot.target.url == target_url)
+        {
+            self.show_running_review(snapshot, ReviewRunPhase::Reviewing);
+        }
+    }
+
+    pub fn review_completed(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        let has_draft = snapshot.has_draft();
+        self.active_reviews.remove(&target_url);
+        if self.review_panel.as_ref().is_some_and(|panel| {
+            panel.snapshot.target.url == target_url
+                && matches!(panel.mode, ReviewPanelMode::Running(_))
+        }) {
+            self.show_review_snapshot(snapshot);
+        } else {
+            self.review_panels.insert(
+                target_url.clone(),
+                Self::panel_for_snapshot(snapshot.clone(), ReviewPanelMode::Draft, None),
+            );
+            if has_draft {
+                self.ready_reviews.insert(
+                    target_url,
+                    format!("{}#{}", snapshot.target.repository, snapshot.target.number),
+                );
+                self.set_notice(format!(
+                    "OpenCode review ready: {}#{} — Shift+R to inspect",
+                    snapshot.target.repository, snapshot.target.number
+                ));
+            } else {
+                self.ready_reviews.remove(&target_url);
+                self.set_notice(format!(
+                    "OpenCode finished without a review draft: {}#{} — Shift+R to inspect or rerun",
+                    snapshot.target.repository, snapshot.target.number
+                ));
+            }
+        }
+    }
+
+    pub fn review_background_failed(&mut self, snapshot: ReviewSnapshot, error: impl Into<String>) {
+        let error = error.into();
+        let target_url = snapshot.target.url.clone();
+        self.active_reviews.remove(&target_url);
+        if snapshot.has_draft() {
+            let mut preserved = snapshot;
+            preserved.warning = Some(format!(
+                "The follow-up could not produce a replacement. The previous draft was preserved. {error}"
+            ));
+            let panel = Self::panel_for_snapshot(preserved, ReviewPanelMode::Draft, None);
+            if self
+                .review_panel
+                .as_ref()
+                .is_some_and(|panel| panel.snapshot.target.url == target_url)
+            {
+                self.present_review_panel(panel);
+            } else {
+                self.review_panels.insert(target_url, panel);
+                self.set_notice(
+                    "OpenCode follow-up failed; the previous review draft was preserved",
+                );
+            }
+            return;
+        }
+        if self
+            .review_panel
+            .as_ref()
+            .is_some_and(|panel| panel.snapshot.target.url == target_url)
+        {
+            self.present_review_panel(Self::panel_for_snapshot(
+                snapshot,
+                ReviewPanelMode::Error,
+                Some(error),
+            ));
+        } else {
+            self.review_panels.insert(
+                target_url,
+                Self::panel_for_snapshot(snapshot, ReviewPanelMode::Error, Some(error.clone())),
+            );
+            self.set_notice(format!(
+                "OpenCode review failed — Shift+R to inspect: {error}"
+            ));
+        }
+    }
+
+    pub fn show_review_for_target(&mut self, target_url: &str) -> bool {
+        if let Some(active) = self.active_reviews.get(target_url).cloned() {
+            self.show_running_review(active.snapshot, active.phase);
+            return true;
+        }
+        let Some(panel) = self.review_panels.remove(target_url) else {
+            return false;
+        };
+        self.ready_reviews.remove(target_url);
+        self.present_review_panel(panel);
+        true
+    }
+
+    pub fn review_chat_closed(&mut self, snapshot: ReviewSnapshot) {
+        let target_url = snapshot.target.url.clone();
+        if let Some(active) = self.active_reviews.get_mut(&target_url) {
+            active.snapshot = snapshot.clone();
+            let phase = active.phase;
+            self.show_running_review(snapshot, phase);
+        } else {
+            self.show_review_snapshot(snapshot);
+        }
+    }
+
+    pub fn active_review_count(&self) -> usize {
+        self.active_reviews.len()
+    }
+
+    pub fn review_agent_state(&self, target_url: &str) -> Option<ReviewAgentState> {
+        if let Some(active) = self.active_reviews.get(target_url) {
+            return Some(match active.phase {
+                ReviewRunPhase::Preparing => ReviewAgentState::Preparing,
+                ReviewRunPhase::Reviewing => ReviewAgentState::Reviewing,
+            });
+        }
+        if self.ready_reviews.contains_key(target_url) {
+            return Some(ReviewAgentState::Ready);
+        }
+        self.review_panel
+            .as_ref()
+            .filter(|panel| panel.snapshot.target.url == target_url)
+            .or_else(|| self.review_panels.get(target_url))
+            .and_then(|panel| match panel.mode {
+                ReviewPanelMode::Draft
+                | ReviewPanelMode::ConfirmNewSession
+                | ReviewPanelMode::PostChoice
+                | ReviewPanelMode::ConfirmPost(_) => {
+                    if panel.snapshot.has_draft() {
+                        Some(ReviewAgentState::Draft)
+                    } else if panel.snapshot.has_session() {
+                        Some(ReviewAgentState::Session)
+                    } else {
+                        None
+                    }
+                }
+                ReviewPanelMode::Error => Some(ReviewAgentState::Failed),
+                ReviewPanelMode::Running(ReviewRunPhase::Preparing) => {
+                    Some(ReviewAgentState::Preparing)
+                }
+                ReviewPanelMode::Running(ReviewRunPhase::Reviewing) => {
+                    Some(ReviewAgentState::Reviewing)
+                }
+                ReviewPanelMode::Prompt => None,
+            })
+    }
+
+    pub fn ready_review_labels(&self) -> Vec<&str> {
+        let mut labels = self
+            .ready_reviews
+            .values()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        labels
+    }
+
+    fn show_running_review(&mut self, snapshot: ReviewSnapshot, phase: ReviewRunPhase) {
+        self.present_review_panel(Self::panel_for_snapshot(
+            snapshot,
+            ReviewPanelMode::Running(phase),
+            None,
+        ));
+    }
+
+    pub fn show_review_error(&mut self, target: ReviewTarget, error: impl Into<String>) {
+        self.present_review_panel(Self::panel_for_snapshot(
+            ReviewSnapshot {
+                target,
+                session_id: None,
+                draft: None,
+                draft_path: PathBuf::new(),
+                workspace: PathBuf::new(),
+                warning: None,
+            },
+            ReviewPanelMode::Error,
+            Some(error.into()),
+        ));
+    }
+
+    pub fn review_posted(&mut self, kind: ReviewKind) {
+        if let Some(panel) = self.review_panel.take() {
+            let target_url = panel.snapshot.target.url;
+            self.review_panels.remove(&target_url);
+            self.ready_reviews.remove(&target_url);
+        }
+        self.set_notice(format!("Posted {} review", kind.label()));
+        self.begin_refresh();
+    }
+
+    pub fn review_failed(&mut self, error: impl Into<String>) {
+        if let Some(panel) = &mut self.review_panel {
+            panel.mode = ReviewPanelMode::Error;
+            panel.error = Some(error.into());
+        }
+    }
+
+    pub fn close_review_panel(&mut self) {
+        self.playbook_editor = None;
+        let Some(panel) = self.review_panel.take() else {
+            return;
+        };
+        if !matches!(panel.mode, ReviewPanelMode::Running(_)) {
+            self.review_panels
+                .insert(panel.snapshot.target.url.clone(), panel);
+        }
+    }
+
+    fn present_review_panel(&mut self, panel: ReviewPanel) {
+        self.close_review_panel();
+        self.review_panels.remove(&panel.snapshot.target.url);
+        self.show_help = false;
+        self.config_editor = None;
+        self.review_panel = Some(panel);
+    }
+
+    fn panel_for_snapshot(
+        snapshot: ReviewSnapshot,
+        mode: ReviewPanelMode,
+        error: Option<String>,
+    ) -> ReviewPanel {
+        ReviewPanel {
+            snapshot,
+            mode,
+            run_kind: ReviewRunKind::ReReview,
+            input: String::new(),
+            applied_playbook: None,
+            scroll: 0,
+            max_scroll: 0,
+            error,
+        }
     }
 
     pub fn begin_refresh(&mut self) {
@@ -518,6 +965,12 @@ impl App {
             .map(|pull_request| pull_request.head_ref.clone())
     }
 
+    pub fn selected_review_target(&self) -> Option<ReviewTarget> {
+        self.items_for(self.tab)
+            .get(self.selected_index())
+            .map(ReviewTarget::from)
+    }
+
     pub fn set_notice(&mut self, message: impl Into<String>) {
         self.notice = Some((message.into(), Instant::now() + Duration::from_secs(3)));
     }
@@ -527,6 +980,9 @@ impl App {
             && matches!(key.code, KeyCode::Char('c' | 'C'))
         {
             return Action::Quit;
+        }
+        if self.review_panel.is_some() {
+            return self.handle_review_key(key);
         }
         if self.config_editor.is_some() {
             return self.handle_config_key(key);
@@ -589,6 +1045,14 @@ impl App {
                 self.open_config(None);
                 Action::None
             }
+            KeyCode::Char('R') => self
+                .selected_review_target()
+                .map(Action::OpenReview)
+                .unwrap_or(Action::None),
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::SHIFT) => self
+                .selected_review_target()
+                .map(Action::OpenReview)
+                .unwrap_or(Action::None),
             KeyCode::Char('C') => self
                 .selected_url()
                 .map(Action::CopyUrl)
@@ -645,6 +1109,647 @@ impl App {
             KeyCode::Char('r') => Action::Refresh,
             _ => Action::None,
         }
+    }
+
+    fn handle_review_key(&mut self, key: KeyEvent) -> Action {
+        if self.playbook_editor.is_some() {
+            return self.handle_playbook_key(key);
+        }
+        let mode = self
+            .review_panel
+            .as_ref()
+            .expect("review panel exists")
+            .mode;
+        match mode {
+            ReviewPanelMode::Prompt => match key.code {
+                KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.open_playbook_library();
+                    Action::None
+                }
+                KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.open_save_current_playbook();
+                    Action::None
+                }
+                KeyCode::Esc => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    if panel.snapshot.has_session() || panel.snapshot.has_draft() {
+                        panel.mode = ReviewPanelMode::Draft;
+                        panel.input.clear();
+                        panel.applied_playbook = None;
+                        panel.error = None;
+                    } else {
+                        self.close_review_panel();
+                    }
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    if panel.run_kind == ReviewRunKind::FollowUp && panel.input.trim().is_empty() {
+                        panel.error = Some(
+                            "Describe what OpenCode should revisit in the saved review.".into(),
+                        );
+                        return Action::None;
+                    }
+                    let focus = (!panel.input.trim().is_empty()).then(|| panel.input.clone());
+                    Action::LaunchReview {
+                        target: panel.snapshot.target.clone(),
+                        mode: LaunchMode::Review(panel.run_kind),
+                        focus,
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .input
+                        .pop();
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .error = None;
+                    Action::None
+                }
+                KeyCode::Delete => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.input.clear();
+                    panel.applied_playbook = None;
+                    panel.error = None;
+                    Action::None
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .input
+                        .push(character);
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .error = None;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            ReviewPanelMode::Running(phase) => match key.code {
+                KeyCode::Esc => {
+                    self.close_review_panel();
+                    Action::None
+                }
+                KeyCode::Char('o') if phase == ReviewRunPhase::Reviewing => {
+                    let panel = self.review_panel.as_ref().expect("review panel exists");
+                    Action::LaunchReview {
+                        target: panel.snapshot.target.clone(),
+                        mode: LaunchMode::Chat,
+                        focus: None,
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll_review(-1);
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll_review(1);
+                    Action::None
+                }
+                KeyCode::PageUp => {
+                    self.scroll_review(-(self.visible_rows as isize));
+                    Action::None
+                }
+                KeyCode::PageDown => {
+                    self.scroll_review(self.visible_rows as isize);
+                    Action::None
+                }
+                KeyCode::Home => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .scroll = 0;
+                    Action::None
+                }
+                KeyCode::End => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.scroll = panel.max_scroll;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            ReviewPanelMode::Draft => match key.code {
+                KeyCode::Esc => {
+                    self.close_review_panel();
+                    Action::None
+                }
+                KeyCode::Char('r') => {
+                    let panel = self.review_panel.as_ref().expect("review panel exists");
+                    Action::LaunchReview {
+                        target: panel.snapshot.target.clone(),
+                        mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                        focus: None,
+                    }
+                }
+                KeyCode::Char('f')
+                    if self.review_panel.as_ref().is_some_and(|panel| {
+                        panel.snapshot.has_draft() && panel.snapshot.has_session()
+                    }) =>
+                {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.mode = ReviewPanelMode::Prompt;
+                    panel.run_kind = ReviewRunKind::FollowUp;
+                    panel.input.clear();
+                    panel.applied_playbook = None;
+                    panel.error = None;
+                    Action::None
+                }
+                KeyCode::Char('e') => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.mode = ReviewPanelMode::Prompt;
+                    panel.run_kind = ReviewRunKind::ReReview;
+                    panel.input.clear();
+                    panel.applied_playbook = None;
+                    panel.error = None;
+                    Action::None
+                }
+                KeyCode::Char('n')
+                    if self
+                        .review_panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.snapshot.has_session()) =>
+                {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::ConfirmNewSession;
+                    Action::None
+                }
+                KeyCode::Char('o') => {
+                    let panel = self.review_panel.as_ref().expect("review panel exists");
+                    if panel.snapshot.has_session() {
+                        Action::LaunchReview {
+                            target: panel.snapshot.target.clone(),
+                            mode: LaunchMode::Chat,
+                            focus: None,
+                        }
+                    } else {
+                        Action::None
+                    }
+                }
+                KeyCode::Char('p') => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    if panel.snapshot.has_draft() {
+                        panel.mode = ReviewPanelMode::PostChoice;
+                    }
+                    Action::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll_review(-1);
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll_review(1);
+                    Action::None
+                }
+                KeyCode::PageUp => {
+                    self.scroll_review(-(self.visible_rows as isize));
+                    Action::None
+                }
+                KeyCode::PageDown => {
+                    self.scroll_review(self.visible_rows as isize);
+                    Action::None
+                }
+                KeyCode::Home => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .scroll = 0;
+                    Action::None
+                }
+                KeyCode::End => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.scroll = panel.max_scroll;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            ReviewPanelMode::ConfirmNewSession => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.mode = ReviewPanelMode::Prompt;
+                    panel.run_kind = ReviewRunKind::NewSession;
+                    panel.input.clear();
+                    panel.applied_playbook = None;
+                    panel.error = None;
+                    Action::None
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::Draft;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            ReviewPanelMode::PostChoice => match key.code {
+                KeyCode::Char('a') => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::ConfirmPost(ReviewKind::Approve);
+                    Action::None
+                }
+                KeyCode::Char('c') => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::ConfirmPost(ReviewKind::Comment);
+                    Action::None
+                }
+                KeyCode::Char('x') => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::ConfirmPost(ReviewKind::RequestChanges);
+                    Action::None
+                }
+                KeyCode::Esc => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::Draft;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            ReviewPanelMode::ConfirmPost(kind) => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let snapshot = self
+                        .review_panel
+                        .as_ref()
+                        .expect("review panel exists")
+                        .snapshot
+                        .clone();
+                    Action::PostReview(snapshot, kind)
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.review_panel
+                        .as_mut()
+                        .expect("review panel exists")
+                        .mode = ReviewPanelMode::Draft;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            ReviewPanelMode::Error => match key.code {
+                KeyCode::Esc => {
+                    self.close_review_panel();
+                    Action::None
+                }
+                KeyCode::Char('r') => {
+                    let target = self
+                        .review_panel
+                        .as_ref()
+                        .expect("review panel exists")
+                        .snapshot
+                        .target
+                        .clone();
+                    Action::OpenReview(target)
+                }
+                _ => Action::None,
+            },
+        }
+    }
+
+    fn open_playbook_library(&mut self) {
+        let selected = self
+            .review_panel
+            .as_ref()
+            .and_then(|panel| panel.applied_playbook.as_deref())
+            .and_then(|selected| {
+                self.playbook_catalog()
+                    .iter()
+                    .position(|playbook| playbook.name.eq_ignore_ascii_case(selected))
+            })
+            .unwrap_or(0);
+        self.playbook_editor = Some(PlaybookEditor::library(selected));
+        self.playbook_hitboxes = PlaybookHitboxes::default();
+    }
+
+    fn open_save_current_playbook(&mut self) {
+        let prompt = self
+            .review_panel
+            .as_ref()
+            .expect("review panel exists")
+            .input
+            .trim()
+            .to_string();
+        if prompt.is_empty() {
+            self.review_panel
+                .as_mut()
+                .expect("review panel exists")
+                .error = Some("Type review instructions before saving a playbook.".into());
+            return;
+        }
+        self.playbook_editor = Some(PlaybookEditor {
+            mode: PlaybookEditorMode::Name,
+            selected: 0,
+            name_input: String::new(),
+            prompt_input: prompt,
+            original_custom_name: None,
+            error: None,
+        });
+        self.playbook_hitboxes = PlaybookHitboxes::default();
+    }
+
+    fn handle_playbook_key(&mut self, key: KeyEvent) -> Action {
+        let mode = self
+            .playbook_editor
+            .as_ref()
+            .expect("playbook editor exists")
+            .mode;
+        match mode {
+            PlaybookEditorMode::Library => match key.code {
+                KeyCode::Esc => {
+                    self.playbook_editor = None;
+                    Action::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_playbook_selection(-1);
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_playbook_selection(1);
+                    Action::None
+                }
+                KeyCode::Home => {
+                    self.playbook_editor.as_mut().unwrap().selected = 0;
+                    Action::None
+                }
+                KeyCode::End => {
+                    self.playbook_editor.as_mut().unwrap().selected =
+                        self.playbook_catalog().len().saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    self.apply_selected_playbook();
+                    Action::None
+                }
+                KeyCode::Char('n') => {
+                    self.playbook_editor = Some(PlaybookEditor {
+                        mode: PlaybookEditorMode::Name,
+                        selected: 0,
+                        name_input: String::new(),
+                        prompt_input: String::new(),
+                        original_custom_name: None,
+                        error: None,
+                    });
+                    Action::None
+                }
+                KeyCode::Char('e') => {
+                    self.edit_selected_playbook();
+                    Action::None
+                }
+                KeyCode::Char('d') => {
+                    let selected = self.selected_playbook();
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    if selected.as_ref().is_some_and(|playbook| playbook.built_in) {
+                        editor.error = Some(
+                            "Built-in playbooks cannot be deleted; edit one to duplicate it."
+                                .into(),
+                        );
+                    } else if selected.is_some() {
+                        editor.mode = PlaybookEditorMode::ConfirmDelete;
+                        editor.error = None;
+                    }
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            PlaybookEditorMode::Name => match key.code {
+                KeyCode::Esc => {
+                    let selected = self.playbook_editor.as_ref().unwrap().selected;
+                    self.playbook_editor = Some(PlaybookEditor::library(selected));
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    self.continue_playbook_name();
+                    Action::None
+                }
+                KeyCode::Backspace => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.name_input.pop();
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Delete => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.name_input.clear();
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.name_input.push(character);
+                    editor.error = None;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            PlaybookEditorMode::Body => match key.code {
+                KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.save_playbook_action()
+                }
+                KeyCode::Esc => {
+                    let selected = self.playbook_editor.as_ref().unwrap().selected;
+                    self.playbook_editor = Some(PlaybookEditor::library(selected));
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.prompt_input.push('\n');
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Backspace => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.prompt_input.pop();
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Delete => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.prompt_input.clear();
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.prompt_input.push(character);
+                    editor.error = None;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            PlaybookEditorMode::ConfirmDelete => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.delete_playbook_action(),
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.mode = PlaybookEditorMode::Library;
+                    editor.error = None;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+        }
+    }
+
+    fn selected_playbook(&self) -> Option<ReviewPlaybook> {
+        let selected = self.playbook_editor.as_ref()?.selected;
+        self.playbook_catalog().get(selected).cloned()
+    }
+
+    fn move_playbook_selection(&mut self, delta: isize) {
+        let len = self.playbook_catalog().len();
+        let editor = self.playbook_editor.as_mut().unwrap();
+        if len == 0 {
+            editor.selected = 0;
+            return;
+        }
+        editor.selected = (editor.selected as isize + delta).rem_euclid(len as isize) as usize;
+        editor.error = None;
+    }
+
+    fn apply_selected_playbook(&mut self) {
+        let Some(playbook) = self.selected_playbook() else {
+            return;
+        };
+        let panel = self.review_panel.as_mut().expect("review panel exists");
+        panel.input = playbook.prompt;
+        panel.applied_playbook = Some(playbook.name);
+        panel.error = None;
+        self.playbook_editor = None;
+    }
+
+    fn edit_selected_playbook(&mut self) {
+        let Some(playbook) = self.selected_playbook() else {
+            return;
+        };
+        let selected = self.playbook_editor.as_ref().unwrap().selected;
+        self.playbook_editor = Some(PlaybookEditor {
+            mode: PlaybookEditorMode::Name,
+            selected,
+            name_input: if playbook.built_in {
+                format!("{} copy", playbook.name)
+            } else {
+                playbook.name.clone()
+            },
+            prompt_input: playbook.prompt,
+            original_custom_name: (!playbook.built_in).then_some(playbook.name),
+            error: None,
+        });
+    }
+
+    fn continue_playbook_name(&mut self) {
+        let (name, original) = {
+            let editor = self.playbook_editor.as_ref().unwrap();
+            (
+                editor.name_input.trim().to_string(),
+                editor.original_custom_name.clone(),
+            )
+        };
+        if let Err(error) = playbook::validate_name(&name) {
+            self.playbook_editor.as_mut().unwrap().error = Some(error.to_string());
+            return;
+        }
+        let duplicate = self.playbook_catalog().into_iter().any(|playbook| {
+            playbook.name.eq_ignore_ascii_case(&name)
+                && original
+                    .as_deref()
+                    .is_none_or(|original| !playbook.name.eq_ignore_ascii_case(original))
+        });
+        if duplicate {
+            self.playbook_editor.as_mut().unwrap().error =
+                Some("A playbook with that name already exists.".into());
+            return;
+        }
+        let editor = self.playbook_editor.as_mut().unwrap();
+        editor.name_input = name;
+        editor.mode = PlaybookEditorMode::Body;
+        editor.error = None;
+    }
+
+    fn save_playbook_action(&mut self) -> Action {
+        let editor = self.playbook_editor.as_ref().unwrap();
+        let playbook = match ReviewPlaybook::custom(&editor.name_input, &editor.prompt_input) {
+            Ok(playbook) => playbook,
+            Err(error) => {
+                self.playbook_editor.as_mut().unwrap().error = Some(error.to_string());
+                return Action::None;
+            }
+        };
+        let original = editor.original_custom_name.clone();
+        let mut playbooks = self.custom_playbooks.clone();
+        if let Some(original) = original {
+            let Some(index) = playbooks
+                .iter()
+                .position(|existing| existing.name.eq_ignore_ascii_case(&original))
+            else {
+                self.playbook_editor.as_mut().unwrap().error =
+                    Some("The playbook being edited no longer exists.".into());
+                return Action::None;
+            };
+            playbooks[index] = playbook.clone();
+        } else {
+            playbooks.push(playbook.clone());
+        }
+        if let Err(error) = playbook::validate_custom_playbooks(&playbooks) {
+            self.playbook_editor.as_mut().unwrap().error = Some(error.to_string());
+            return Action::None;
+        }
+        Action::SavePlaybooks {
+            playbooks,
+            selected_name: Some(playbook.name.clone()),
+            notice: format!("Saved review playbook: {}", playbook.name),
+        }
+    }
+
+    fn delete_playbook_action(&mut self) -> Action {
+        let Some(selected) = self.selected_playbook() else {
+            return Action::None;
+        };
+        if selected.built_in {
+            self.playbook_editor.as_mut().unwrap().error =
+                Some("Built-in playbooks cannot be deleted.".into());
+            return Action::None;
+        }
+        let mut playbooks = self.custom_playbooks.clone();
+        playbooks.retain(|playbook| !playbook.name.eq_ignore_ascii_case(&selected.name));
+        Action::SavePlaybooks {
+            playbooks,
+            selected_name: None,
+            notice: format!("Deleted review playbook: {}", selected.name),
+        }
+    }
+
+    fn scroll_review(&mut self, delta: isize) {
+        let panel = self.review_panel.as_mut().expect("review panel exists");
+        let distance = delta.unsigned_abs().min(u16::MAX as usize) as u16;
+        panel.scroll = if delta.is_negative() {
+            panel.scroll.saturating_sub(distance)
+        } else {
+            panel.scroll.saturating_add(distance)
+        }
+        .min(panel.max_scroll);
     }
 
     fn handle_config_key(&mut self, key: KeyEvent) -> Action {
@@ -733,6 +1838,17 @@ impl App {
         if self.show_help {
             return Action::None;
         }
+        if self.playbook_editor.is_some() {
+            return self.handle_playbook_mouse(mouse);
+        }
+        if self.review_panel.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_review(-3),
+                MouseEventKind::ScrollDown => self.scroll_review(3),
+                _ => {}
+            }
+            return Action::None;
+        }
         if self.config_editor.is_some() {
             return self.handle_config_mouse(mouse);
         }
@@ -780,6 +1896,80 @@ impl App {
                         .selected_url()
                         .map(Action::Open)
                         .unwrap_or(Action::None);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn handle_playbook_mouse(&mut self, mouse: MouseEvent) -> Action {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self
+                    .playbook_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.mode == PlaybookEditorMode::Library)
+                {
+                    self.move_playbook_selection(-1);
+                }
+                Action::None
+            }
+            MouseEventKind::ScrollDown => {
+                if self
+                    .playbook_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.mode == PlaybookEditorMode::Library)
+                {
+                    self.move_playbook_selection(1);
+                }
+                Action::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let x = mouse.column;
+                let y = mouse.row;
+                let hitboxes = self.playbook_hitboxes.clone();
+                if let Some(hitbox) = hitboxes
+                    .rows
+                    .iter()
+                    .find(|hitbox| contains(hitbox.rect, x, y))
+                {
+                    if let Some(editor) = &mut self.playbook_editor {
+                        editor.selected = hitbox.index;
+                        editor.error = None;
+                    }
+                    return Action::None;
+                }
+                let mode = self.playbook_editor.as_ref().unwrap().mode;
+                if contains(hitboxes.primary, x, y) {
+                    return self.handle_playbook_key(match mode {
+                        PlaybookEditorMode::Body => {
+                            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+                        }
+                        _ => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    });
+                }
+                if contains(hitboxes.new, x, y) {
+                    return self.handle_playbook_key(KeyEvent::new(
+                        KeyCode::Char('n'),
+                        KeyModifiers::NONE,
+                    ));
+                }
+                if contains(hitboxes.edit, x, y) {
+                    return self.handle_playbook_key(KeyEvent::new(
+                        KeyCode::Char('e'),
+                        KeyModifiers::NONE,
+                    ));
+                }
+                if contains(hitboxes.delete, x, y) {
+                    return self.handle_playbook_key(KeyEvent::new(
+                        KeyCode::Char('d'),
+                        KeyModifiers::NONE,
+                    ));
+                }
+                if contains(hitboxes.back, x, y) {
+                    return self
+                        .handle_playbook_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 }
                 Action::None
             }
@@ -961,6 +2151,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
+    fn control_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
     #[test]
     fn keyboard_navigation_switches_tabs_scrolls_and_opens() {
         let mut app = app();
@@ -1117,6 +2311,554 @@ mod tests {
 
         assert_eq!(app.handle_key(key(KeyCode::Char('t'))), Action::None);
         assert!(app.config_editor.is_some());
+    }
+
+    fn review_snapshot(session: bool, draft: bool) -> ReviewSnapshot {
+        review_snapshot_for(1, session, draft)
+    }
+
+    fn review_snapshot_for(number: u64, session: bool, draft: bool) -> ReviewSnapshot {
+        ReviewSnapshot {
+            target: ReviewTarget::from(&pr(number)),
+            session_id: session.then(|| format!("ses_review_{number}")),
+            draft: draft.then(|| "# Summary\n\nReady to review.\n".into()),
+            draft_path: PathBuf::from(format!("/tmp/kritikon-review-{number}.md")),
+            workspace: PathBuf::from(format!("/tmp/kritikon-review-workspace-{number}")),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn shift_r_opens_agent_review_without_stealing_lowercase_refresh() {
+        let mut app = app();
+        assert_eq!(app.handle_key(key(KeyCode::Char('r'))), Action::Refresh);
+        assert_eq!(
+            app.handle_key(shifted_key(KeyCode::Char('R'))),
+            Action::OpenReview(ReviewTarget::from(&pr(1)))
+        );
+        assert_eq!(
+            app.handle_key(shifted_key(KeyCode::Char('r'))),
+            Action::OpenReview(ReviewTarget::from(&pr(1)))
+        );
+    }
+
+    #[test]
+    fn new_review_accepts_optional_focus_and_launches_template() {
+        let mut app = app();
+        let snapshot = review_snapshot(false, false);
+        app.show_review_snapshot(snapshot.clone());
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Prompt
+        );
+
+        for character in "race conditions".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target,
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                focus: Some("race conditions".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn review_playbooks_are_selected_as_editable_focus_without_auto_launching() {
+        let mut app = app();
+        let snapshot = review_snapshot(false, false);
+        app.show_review_snapshot(snapshot.clone());
+
+        assert_eq!(
+            app.handle_key(control_key(KeyCode::Char('p'))),
+            Action::None
+        );
+        assert_eq!(
+            app.playbook_editor.as_ref().unwrap().mode,
+            PlaybookEditorMode::Library
+        );
+        assert_eq!(app.playbook_catalog().len(), 4);
+        assert_eq!(app.handle_key(key(KeyCode::Down)), Action::None);
+        let selected = app.playbook_catalog()[1].clone();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(app.playbook_editor.is_none());
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.input, selected.prompt);
+        assert_eq!(
+            panel.applied_playbook.as_deref(),
+            Some(selected.name.as_str())
+        );
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target,
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                focus: Some(selected.prompt),
+            }
+        );
+    }
+
+    #[test]
+    fn custom_playbooks_can_be_named_saved_reused_and_deleted() {
+        let mut app = app();
+        app.show_review_snapshot(review_snapshot(false, false));
+        for character in "Check feature flags and rollback safety.".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            app.handle_key(control_key(KeyCode::Char('s'))),
+            Action::None
+        );
+        assert_eq!(
+            app.playbook_editor.as_ref().unwrap().mode,
+            PlaybookEditorMode::Name
+        );
+        for character in "Release safety".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(
+            app.playbook_editor.as_ref().unwrap().mode,
+            PlaybookEditorMode::Body
+        );
+        app.handle_key(key(KeyCode::Enter));
+        for character in "Check mixed-version deployment behavior.".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        let expected_prompt =
+            "Check feature flags and rollback safety.\nCheck mixed-version deployment behavior.";
+        let (playbooks, selected_name, notice) =
+            match app.handle_key(control_key(KeyCode::Char('s'))) {
+                Action::SavePlaybooks {
+                    playbooks,
+                    selected_name,
+                    notice,
+                } => (playbooks, selected_name, notice),
+                action => panic!("expected playbook save, got {action:?}"),
+            };
+        assert_eq!(playbooks.len(), 1);
+        assert_eq!(playbooks[0].name, "Release safety");
+        assert_eq!(playbooks[0].prompt, expected_prompt);
+        app.playbooks_saved(playbooks, selected_name, notice);
+        assert_eq!(app.playbook_catalog().len(), 5);
+        assert_eq!(app.playbook_editor.as_ref().unwrap().selected, 4);
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(app.review_panel.as_ref().unwrap().input, expected_prompt);
+
+        app.handle_key(control_key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.handle_key(key(KeyCode::Char('d'))), Action::None);
+        assert_eq!(
+            app.playbook_editor.as_ref().unwrap().mode,
+            PlaybookEditorMode::ConfirmDelete
+        );
+        let (playbooks, selected_name, notice) = match app.handle_key(key(KeyCode::Enter)) {
+            Action::SavePlaybooks {
+                playbooks,
+                selected_name,
+                notice,
+            } => (playbooks, selected_name, notice),
+            action => panic!("expected playbook deletion, got {action:?}"),
+        };
+        assert!(playbooks.is_empty());
+        app.playbooks_saved(playbooks, selected_name, notice);
+        assert_eq!(app.playbook_catalog().len(), 4);
+    }
+
+    #[test]
+    fn playbook_validation_and_built_in_protection_are_visible_in_the_flow() {
+        let mut app = app();
+        app.show_review_snapshot(review_snapshot(false, false));
+        assert_eq!(
+            app.handle_key(control_key(KeyCode::Char('s'))),
+            Action::None
+        );
+        assert!(
+            app.review_panel
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Type review instructions"))
+        );
+
+        app.handle_key(control_key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char('d')));
+        let editor = app.playbook_editor.as_ref().unwrap();
+        assert_eq!(editor.mode, PlaybookEditorMode::Library);
+        assert!(
+            editor
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cannot be deleted"))
+        );
+    }
+
+    #[test]
+    fn saved_review_can_chat_rerun_and_requires_post_confirmation() {
+        let mut app = app();
+        let snapshot = review_snapshot(true, true);
+        app.show_review_snapshot(snapshot.clone());
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o'))),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Chat,
+                focus: None,
+            }
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('r'))),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                focus: None,
+            }
+        );
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('p'))), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::PostChoice
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('c'))), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::ConfirmPost(ReviewKind::Comment)
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::PostReview(snapshot, ReviewKind::Comment)
+        );
+    }
+
+    #[test]
+    fn saved_review_separates_follow_up_rereview_and_new_session_flows() {
+        let mut app = app();
+        let snapshot = review_snapshot(true, true);
+        app.show_review_snapshot(snapshot.clone());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('f'))), Action::None);
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.mode, ReviewPanelMode::Prompt);
+        assert_eq!(panel.run_kind, ReviewRunKind::FollowUp);
+        assert_eq!(panel.snapshot.draft, snapshot.draft);
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(
+            app.review_panel
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("what OpenCode should revisit"))
+        );
+        for character in "verify the cancellation finding".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::FollowUp),
+                focus: Some("verify the cancellation finding".into()),
+            }
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().run_kind,
+            ReviewRunKind::ReReview
+        );
+        for character in "focus on auth boundaries".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                focus: Some("focus on auth boundaries".into()),
+            }
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('r'))),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                focus: None,
+            }
+        );
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::ConfirmNewSession
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.mode, ReviewPanelMode::Prompt);
+        assert_eq!(panel.run_kind, ReviewRunKind::NewSession);
+        assert_eq!(panel.snapshot.draft, snapshot.draft);
+        assert_eq!(panel.snapshot.session_id, snapshot.session_id);
+        for character in "focus on authorization".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::NewSession),
+                focus: Some("focus on authorization".into()),
+            }
+        );
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Action::None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target,
+                mode: LaunchMode::Review(ReviewRunKind::NewSession),
+                focus: None,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_follow_up_restores_the_previous_draft_instead_of_an_error_only_panel() {
+        let mut app = app();
+        let snapshot = review_snapshot(true, true);
+        let target_url = snapshot.target.url.clone();
+        app.review_started(snapshot.clone());
+
+        app.review_background_failed(snapshot.clone(), "replacement file was not written");
+
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.mode, ReviewPanelMode::Draft);
+        assert_eq!(panel.snapshot.draft, snapshot.draft);
+        assert!(
+            panel
+                .snapshot
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("previous draft was preserved"))
+        );
+        assert_eq!(
+            app.review_agent_state(&target_url),
+            Some(ReviewAgentState::Draft)
+        );
+    }
+
+    #[test]
+    fn background_review_can_be_closed_reopened_attached_and_completed() {
+        let mut app = app();
+        let initial = review_snapshot(false, false);
+        let target_url = initial.target.url.clone();
+        app.review_started(initial);
+        assert_eq!(app.active_review_count(), 1);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Running(ReviewRunPhase::Preparing)
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('o'))), Action::None);
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.review_panel.is_none());
+        assert!(app.show_review_for_target(&target_url));
+
+        let ready = review_snapshot(true, false);
+        app.review_session_ready(ready.clone());
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Running(ReviewRunPhase::Reviewing)
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o'))),
+            Action::LaunchReview {
+                target: ready.target.clone(),
+                mode: LaunchMode::Chat,
+                focus: None,
+            }
+        );
+
+        let completed = review_snapshot(true, true);
+        app.review_completed(completed.clone());
+        assert_eq!(app.active_review_count(), 0);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
+        );
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().snapshot.draft,
+            completed.draft
+        );
+    }
+
+    #[test]
+    fn completed_session_without_markdown_is_not_reported_as_a_ready_draft() {
+        let mut app = app();
+        let initial = review_snapshot(false, false);
+        let target_url = initial.target.url.clone();
+        app.review_started(initial);
+        app.close_review_panel();
+
+        app.review_completed(review_snapshot(true, false));
+
+        assert_eq!(app.active_review_count(), 0);
+        assert_eq!(
+            app.review_agent_state(&target_url),
+            Some(ReviewAgentState::Session)
+        );
+        assert!(app.ready_review_labels().is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(notice, _)| notice.contains("finished without a review draft"))
+        );
+
+        assert!(app.show_review_for_target(&target_url));
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.mode, ReviewPanelMode::Draft);
+        assert!(panel.snapshot.has_session());
+        assert!(!panel.snapshot.has_draft());
+        assert_eq!(
+            app.review_agent_state(&target_url),
+            Some(ReviewAgentState::Session)
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('p'))), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
+        );
+    }
+
+    #[test]
+    fn concurrent_review_panels_and_failures_are_scoped_to_the_exact_pull_request() {
+        let mut app = app();
+        let first = review_snapshot_for(1, false, false);
+        let second = review_snapshot_for(2, false, false);
+        let first_url = first.target.url.clone();
+        let second_url = second.target.url.clone();
+
+        app.review_started(first);
+        app.close_review_panel();
+        app.review_started(second);
+        app.close_review_panel();
+        app.review_session_ready(review_snapshot_for(1, true, false));
+
+        assert_eq!(
+            app.review_agent_state(&first_url),
+            Some(ReviewAgentState::Reviewing)
+        );
+        assert_eq!(
+            app.review_agent_state(&second_url),
+            Some(ReviewAgentState::Preparing)
+        );
+
+        assert!(app.show_review_for_target(&second_url));
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.snapshot.target.number, 2);
+        assert_eq!(
+            panel.mode,
+            ReviewPanelMode::Running(ReviewRunPhase::Preparing)
+        );
+        app.close_review_panel();
+
+        assert!(app.show_review_for_target(&first_url));
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.snapshot.target.number, 1);
+        assert_eq!(
+            panel.mode,
+            ReviewPanelMode::Running(ReviewRunPhase::Reviewing)
+        );
+
+        app.review_background_failed(
+            review_snapshot_for(2, false, false),
+            "second PR failed independently",
+        );
+        assert_eq!(app.review_panel.as_ref().unwrap().snapshot.target.number, 1);
+        assert_eq!(
+            app.review_agent_state(&second_url),
+            Some(ReviewAgentState::Failed)
+        );
+
+        app.close_review_panel();
+        assert!(app.show_review_for_target(&second_url));
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.snapshot.target.number, 2);
+        assert_eq!(panel.mode, ReviewPanelMode::Error);
+        assert_eq!(
+            panel.error.as_deref(),
+            Some("second PR failed independently")
+        );
+    }
+
+    #[test]
+    fn unfinished_review_prompts_are_preserved_per_pull_request() {
+        let mut app = app();
+        let first = review_snapshot_for(1, false, false);
+        let second = review_snapshot_for(2, false, false);
+        let first_url = first.target.url.clone();
+        let second_url = second.target.url.clone();
+
+        app.show_review_snapshot(first);
+        for character in "focus one".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.close_review_panel();
+
+        app.show_review_snapshot(second);
+        for character in "focus two".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.close_review_panel();
+
+        assert!(app.show_review_for_target(&first_url));
+        assert_eq!(app.review_panel.as_ref().unwrap().snapshot.target.number, 1);
+        assert_eq!(app.review_panel.as_ref().unwrap().input, "focus one");
+        app.close_review_panel();
+
+        assert!(app.show_review_for_target(&second_url));
+        assert_eq!(app.review_panel.as_ref().unwrap().snapshot.target.number, 2);
+        assert_eq!(app.review_panel.as_ref().unwrap().input, "focus two");
+    }
+
+    #[test]
+    fn completed_background_review_stays_marked_ready_until_opened() {
+        let mut app = app();
+        let initial = review_snapshot(false, false);
+        app.review_started(initial);
+        app.handle_key(key(KeyCode::Esc));
+
+        let completed = review_snapshot(true, true);
+        app.review_completed(completed.clone());
+        assert!(app.review_panel.is_none());
+        assert_eq!(app.ready_review_labels(), vec!["acme/app#1"]);
+
+        app.show_review_snapshot(completed);
+        assert!(app.ready_review_labels().is_empty());
     }
 
     #[test]

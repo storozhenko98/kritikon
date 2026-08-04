@@ -5,9 +5,13 @@ mod config;
 mod dev;
 mod github;
 mod model;
+mod playbook;
+mod review_agent;
 mod ui;
 mod updater;
 
+#[cfg(debug_assertions)]
+use std::time::Instant;
 use std::{
     io::{self, stdout},
     time::Duration,
@@ -149,9 +153,23 @@ fn run_tui(
     source: DataSource,
     config_error: Option<String>,
 ) -> Result<()> {
+    let playbook_store = playbook::PlaybookStore::beside_config(store.path())?;
+    let (custom_playbooks, playbook_warning) = match playbook_store.load_or_default() {
+        Ok(playbooks) => (playbooks, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!(
+                "Saved playbooks could not be loaded; built-ins remain available. {error:#}"
+            )),
+        ),
+    };
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
     let mut app = App::new(settings, store.path().to_path_buf(), source);
+    app.set_custom_playbooks(custom_playbooks, playbook_warning);
+    let mut review_coordinator = review_agent::ReviewCoordinator::system()?;
+    #[cfg(debug_assertions)]
+    let mut development_review_events = Vec::<(Instant, review_agent::ReviewEvent)>::new();
     if let Some(error) = config_error {
         app.open_config(Some(format!(
             "Saved configuration is invalid; safe defaults are active. {error}"
@@ -166,6 +184,22 @@ fn run_tui(
     app.begin_refresh();
 
     loop {
+        for event in review_coordinator.drain_events() {
+            apply_review_event(&mut app, event);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let now = Instant::now();
+            let mut index = 0;
+            while index < development_review_events.len() {
+                if development_review_events[index].0 <= now {
+                    let (_, event) = development_review_events.remove(index);
+                    apply_review_event(&mut app, event);
+                } else {
+                    index += 1;
+                }
+            }
+        }
         app.tick();
         terminal
             .draw(|frame| ui::render(frame, &mut app))
@@ -198,6 +232,126 @@ fn run_tui(
                         app.set_notice(format!("Could not copy PR URL: {error:#}"));
                     }
                 },
+                Action::OpenReview(target) => {
+                    if app.show_review_for_target(&target.url) {
+                        continue;
+                    }
+                    #[cfg(debug_assertions)]
+                    let result = if source != DataSource::Github {
+                        Ok(review_agent::development_snapshot(target.clone()))
+                    } else {
+                        review_agent::inspect(target.clone()).map_err(|error| format!("{error:#}"))
+                    };
+                    #[cfg(not(debug_assertions))]
+                    let result =
+                        review_agent::inspect(target.clone()).map_err(|error| format!("{error:#}"));
+
+                    match result {
+                        Ok(snapshot) => app.show_review_snapshot(snapshot),
+                        Err(error) => app.show_review_error(target, error),
+                    }
+                }
+                Action::LaunchReview {
+                    target,
+                    mode,
+                    focus,
+                } => {
+                    #[cfg(debug_assertions)]
+                    if source != DataSource::Github {
+                        match mode {
+                            review_agent::LaunchMode::Review(kind) => {
+                                let mut preparing =
+                                    review_agent::development_snapshot(target.clone());
+                                if kind != review_agent::ReviewRunKind::FollowUp {
+                                    preparing.draft = None;
+                                }
+                                if kind == review_agent::ReviewRunKind::NewSession {
+                                    preparing.session_id = None;
+                                }
+                                app.review_started(preparing);
+
+                                let mut running =
+                                    review_agent::development_snapshot(target.clone());
+                                if kind != review_agent::ReviewRunKind::FollowUp {
+                                    running.draft = None;
+                                }
+                                let mut completed = review_agent::development_snapshot(target);
+                                if let Some(focus) = focus {
+                                    completed.warning = Some(format!(
+                                        "DEV simulation used custom focus: {}",
+                                        focus.trim()
+                                    ));
+                                }
+                                let now = Instant::now();
+                                development_review_events.push((
+                                    now + Duration::from_millis(600),
+                                    review_agent::ReviewEvent::SessionReady(running),
+                                ));
+                                development_review_events.push((
+                                    now + Duration::from_secs(2),
+                                    review_agent::ReviewEvent::Completed(completed),
+                                ));
+                            }
+                            review_agent::LaunchMode::Chat => {
+                                app.set_notice(
+                                    "DEV: simulated OpenCode attach/detach; background review continues",
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
+                    match mode {
+                        review_agent::LaunchMode::Review(kind) => {
+                            match review_coordinator.start_review(target.clone(), kind, focus) {
+                                Ok(snapshot) => app.review_started(snapshot),
+                                Err(error) => {
+                                    app.show_review_error(target, format!("{error:#}"));
+                                }
+                            }
+                        }
+                        review_agent::LaunchMode::Chat => {
+                            let snapshot = match review_agent::inspect(target.clone()) {
+                                Ok(snapshot) => snapshot,
+                                Err(error) => {
+                                    app.show_review_error(target, format!("{error:#}"));
+                                    continue;
+                                }
+                            };
+                            suspend_terminal(&mut terminal)?;
+                            let result = review_coordinator
+                                .open_chat(&snapshot)
+                                .map_err(|error| format!("{error:#}"));
+                            resume_terminal(&mut terminal)?;
+                            match result {
+                                Ok(snapshot) => app.review_chat_closed(snapshot),
+                                Err(error) => app.show_review_error(target, error),
+                            }
+                        }
+                    }
+                }
+                Action::PostReview(snapshot, kind) => {
+                    #[cfg(debug_assertions)]
+                    if source != DataSource::Github {
+                        app.review_posted(kind);
+                        continue;
+                    }
+
+                    match review_agent::post_review(&snapshot, kind) {
+                        Ok(()) => app.review_posted(kind),
+                        Err(error) => app.review_failed(format!("{error:#}")),
+                    }
+                }
+                Action::SavePlaybooks {
+                    playbooks,
+                    selected_name,
+                    notice,
+                } => match playbook_store.save(&playbooks) {
+                    Ok(()) => app.playbooks_saved(playbooks, selected_name, notice),
+                    Err(error) => app.playbook_write_failed(format!(
+                        "Could not save review playbooks: {error:#}"
+                    )),
+                },
                 Action::SaveConfig(config) => match store.save(&config) {
                     Ok(()) => app.apply_config(config, false),
                     Err(error) => app.config_write_failed(format!("Could not save: {error:#}")),
@@ -211,6 +365,20 @@ fn run_tui(
     }
 
     Ok(())
+}
+
+fn apply_review_event(app: &mut App, event: review_agent::ReviewEvent) {
+    match event {
+        review_agent::ReviewEvent::SessionReady(snapshot) => {
+            app.review_session_ready(snapshot);
+        }
+        review_agent::ReviewEvent::Completed(snapshot) => {
+            app.review_completed(snapshot);
+        }
+        review_agent::ReviewEvent::Failed { snapshot, error } => {
+            app.review_background_failed(snapshot, error);
+        }
+    }
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -228,6 +396,35 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
             Err(error).context("could not create terminal backend")
         }
     }
+}
+
+fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    terminal
+        .show_cursor()
+        .context("could not show terminal cursor")?;
+    disable_raw_mode().context("could not suspend terminal raw mode")?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .context("could not suspend Kritikon terminal screen")
+}
+
+fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    enable_raw_mode().context("could not restore terminal raw mode")?;
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error).context("could not restore Kritikon terminal screen");
+    }
+    terminal.clear().context("could not redraw Kritikon")?;
+    terminal
+        .hide_cursor()
+        .context("could not hide terminal cursor")
 }
 
 struct TerminalGuard;
