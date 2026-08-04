@@ -14,6 +14,8 @@ It keeps the three queues that matter in one calm interface:
 2. **Involved** — open PRs you committed to, reviewed, commented on, were assigned to, or were mentioned in.
 3. **My PRs** — every open PR you authored, including drafts and PRs with no reviews.
 
+When you want a second set of eyes, `Shift+R` can optionally start a PR-scoped OpenCode review. It runs headlessly in the background while Kritikon stays fully usable, preserves one resumable session per PR, lets you attach or detach the real OpenCode TUI, and renders the resulting Markdown for your review before Kritikon can post anything. OpenCode is not required for the normal dashboard.
+
 The list stays compact while the selected PR shows its full review breakdown, outstanding reviewers, draft/ready state, mergeability, CI rollup, branches, files, line changes, comments, labels, and timestamps. Closed PRs are never queried.
 
 ## Install
@@ -22,6 +24,7 @@ Prerequisites:
 
 - [GitHub CLI](https://cli.github.com/) installed and authenticated with `gh auth login`.
 - Apple Silicon macOS, x86_64 Linux, or ARM64 Linux. Windows and Intel macOS are not supported.
+- OpenCode is optional and is only required when you invoke the review-agent workflow with `Shift+R`.
 
 Install the latest release without `sudo`:
 
@@ -78,7 +81,7 @@ An unavailable or slow network never blocks the dashboard for more than three se
 
 ## Optional OpenCode review agent
 
-`Shift+R` turns the selected PR into a resumable agent-review workspace. This feature is optional: the normal dashboard has no OpenCode dependency.
+`Shift+R` turns the selected PR into a resumable agent-review workspace. This feature is entirely optional: every monitoring, navigation, refresh, and browser-opening feature works without OpenCode installed.
 
 Requirements:
 

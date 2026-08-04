@@ -191,11 +191,13 @@ h1 {
 .pr mark.changes { background: var(--red); }
 .pr mark.approved { background: var(--green); }
 .pr mark.comments { background: var(--amber); }
+.pr mark.agent { color: var(--aqua); background: var(--aqua-dark); }
 
 .details { margin-top: 14px; padding: 10px; border: 1px solid #566165; }
 .details small { color: var(--muted); }
 .details b { color: var(--aqua); }
 .details .danger { color: var(--red); }
+.agent-status { margin-top: 10px; color: var(--aqua); }
 .shortcuts { margin-top: 12px; overflow: hidden; white-space: nowrap; color: var(--muted); }
 
 .manifesto {
