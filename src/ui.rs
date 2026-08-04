@@ -990,8 +990,8 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
-                    Constraint::Min(8),
-                    Constraint::Length(5),
+                    Constraint::Min(6),
+                    Constraint::Length(8),
                 ])
                 .split(inner);
             frame.render_widget(Paragraph::new(header), chunks[0]);
@@ -1019,31 +1019,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 .wrap(Wrap { trim: true }),
                 chunks[1],
             );
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(vec![
-                        Span::styled("> ", Style::default().fg(ACCENT)),
-                        Span::raw(if input.is_empty() {
-                            "".into()
-                        } else {
-                            input
-                        }),
-                        Span::styled("█", Style::default().fg(ACCENT)),
-                    ]),
-                    Line::raw(""),
-                    Line::from(Span::styled(
-                        "Enter run in background  ·  Backspace edit  ·  Delete clear  ·  Esc cancel",
-                        Style::default().fg(MUTED),
-                    )),
-                ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                ),
-                chunks[2],
-            );
+            render_review_focus_editor(frame, chunks[2], &input);
         }
         ReviewPanelMode::Running(phase) => {
             let (status, detail, color) = match phase {
@@ -1252,6 +1228,90 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             );
         }
     }
+}
+
+fn render_review_focus_editor(frame: &mut Frame<'_>, area: Rect, input: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(rows[0]);
+
+    let editor_line = if input.is_empty() {
+        Line::from(vec![
+            Span::styled("▌", Style::default().fg(ACCENT)),
+            Span::styled(
+                " Add optional guidance for this review…",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(input.to_string()),
+            Span::styled("▌", Style::default().fg(ACCENT)),
+        ])
+    };
+    let editor = Paragraph::new(editor_line).wrap(Wrap { trim: false });
+    let line_count = editor.line_count(columns[1].width).max(1) as u16;
+    let visible_lines = columns[1].height.max(1);
+    let scroll = line_count.saturating_sub(visible_lines);
+    let character_count = input.chars().count();
+    let title = if input.is_empty() {
+        " Focus instructions ".to_string()
+    } else if scroll > 0 {
+        format!(
+            " Focus instructions · {character_count} chars · latest {visible_lines}/{line_count} lines "
+        )
+    } else {
+        format!(" Focus instructions · {character_count} chars ")
+    };
+
+    frame.render_widget(block.title(title), area);
+    if columns[0].height > 0 {
+        if scroll > 0 {
+            frame.render_widget(
+                Paragraph::new("↑").style(Style::default().fg(MUTED)),
+                Rect::new(columns[0].x, columns[0].y, columns[0].width, 1),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new("›").style(Style::default().fg(ACCENT)),
+            Rect::new(
+                columns[0].x,
+                columns[0].bottom().saturating_sub(1),
+                columns[0].width,
+                1,
+            ),
+        );
+    }
+    frame.render_widget(editor.scroll((scroll, 0)), columns[1]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Enter", Style::default().fg(ACCENT)),
+                Span::styled(" run in background", Style::default().fg(MUTED)),
+                Span::styled("  ·  Esc", Style::default().fg(ACCENT)),
+                Span::styled(" cancel", Style::default().fg(MUTED)),
+            ]),
+            Line::from(Span::styled(
+                "Backspace edit  ·  Delete clear",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .alignment(Alignment::Center),
+        rows[1],
+    );
 }
 
 fn markdown_lines(source: &str) -> Vec<Line<'static>> {
@@ -1793,6 +1853,43 @@ mod tests {
         assert!(rendered.contains("permission auto-approval"));
         assert!(rendered.contains("Optional focus"));
         assert!(rendered.contains("Enter run in background"));
+    }
+
+    #[test]
+    fn long_review_focus_wraps_and_keeps_the_latest_text_and_cursor_visible() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(false, false));
+        app.review_panel.as_mut().unwrap().input = format!(
+            "BEGINNING {} END-CURSOR-VISIBLE",
+            "check cancellation, concurrency, and data-loss behavior carefully. ".repeat(24)
+        );
+        let backend = TestBackend::new(70, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Focus instructions"));
+        assert!(rendered.contains("latest"));
+        assert!(rendered.contains("END-CURSOR-VISIBLE"));
+        assert!(rendered.contains('▌'));
+        assert!(rendered.contains('↑'));
+        assert!(!rendered.contains("BEGINNING"));
     }
 
     #[test]
