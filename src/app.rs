@@ -13,6 +13,7 @@ use crate::{
     config::{Config, parse_refresh_seconds},
     github,
     model::{DashboardData, InvolvementReason, PullRequest},
+    playbook::{self, ReviewPlaybook},
     review_agent::{LaunchMode, ReviewKind, ReviewRunKind, ReviewSnapshot, ReviewTarget},
 };
 #[cfg(debug_assertions)]
@@ -73,6 +74,11 @@ pub enum Action {
         focus: Option<String>,
     },
     PostReview(ReviewSnapshot, ReviewKind),
+    SavePlaybooks {
+        playbooks: Vec<ReviewPlaybook>,
+        selected_name: Option<String>,
+        notice: String,
+    },
     SaveConfig(Config),
     ResetConfig,
 }
@@ -146,9 +152,41 @@ pub struct ReviewPanel {
     pub mode: ReviewPanelMode,
     pub run_kind: ReviewRunKind,
     pub input: String,
+    pub applied_playbook: Option<String>,
     pub scroll: u16,
     pub max_scroll: u16,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybookEditorMode {
+    Library,
+    Name,
+    Body,
+    ConfirmDelete,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaybookEditor {
+    pub mode: PlaybookEditorMode,
+    pub selected: usize,
+    pub name_input: String,
+    pub prompt_input: String,
+    pub original_custom_name: Option<String>,
+    pub error: Option<String>,
+}
+
+impl PlaybookEditor {
+    fn library(selected: usize) -> Self {
+        Self {
+            mode: PlaybookEditorMode::Library,
+            selected,
+            name_input: String::new(),
+            prompt_input: String::new(),
+            original_custom_name: None,
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +220,16 @@ pub struct ConfigHitboxes {
     pub cancel: Rect,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PlaybookHitboxes {
+    pub rows: Vec<RowHitbox>,
+    pub primary: Rect,
+    pub new: Rect,
+    pub edit: Rect,
+    pub delete: Rect,
+    pub back: Rect,
+}
+
 pub struct App {
     pub data: Option<DashboardData>,
     pub tab: Tab,
@@ -203,6 +251,10 @@ pub struct App {
     pub config_editor: Option<ConfigEditor>,
     pub config_hitboxes: ConfigHitboxes,
     pub review_panel: Option<ReviewPanel>,
+    pub playbook_editor: Option<PlaybookEditor>,
+    pub playbook_hitboxes: PlaybookHitboxes,
+    pub playbook_warning: Option<String>,
+    custom_playbooks: Vec<ReviewPlaybook>,
     review_panels: HashMap<String, ReviewPanel>,
     active_reviews: HashMap<String, ActiveReview>,
     ready_reviews: HashMap<String, String>,
@@ -240,6 +292,10 @@ impl App {
             config_editor: None,
             config_hitboxes: ConfigHitboxes::default(),
             review_panel: None,
+            playbook_editor: None,
+            playbook_hitboxes: PlaybookHitboxes::default(),
+            playbook_warning: None,
+            custom_playbooks: Vec::new(),
             review_panels: HashMap::new(),
             active_reviews: HashMap::new(),
             ready_reviews: HashMap::new(),
@@ -272,6 +328,52 @@ impl App {
         self.config_editor = Some(ConfigEditor::new(self.config, error));
     }
 
+    pub fn set_custom_playbooks(
+        &mut self,
+        playbooks: Vec<ReviewPlaybook>,
+        warning: Option<String>,
+    ) {
+        self.custom_playbooks = playbooks;
+        self.playbook_warning = warning;
+    }
+
+    pub fn playbook_catalog(&self) -> Vec<ReviewPlaybook> {
+        playbook::catalog(&self.custom_playbooks)
+    }
+
+    pub fn playbooks_saved(
+        &mut self,
+        playbooks: Vec<ReviewPlaybook>,
+        selected_name: Option<String>,
+        notice: String,
+    ) {
+        self.custom_playbooks = playbooks;
+        self.playbook_warning = None;
+        let catalog = self.playbook_catalog();
+        if let Some(editor) = &mut self.playbook_editor {
+            editor.mode = PlaybookEditorMode::Library;
+            editor.selected = selected_name
+                .as_deref()
+                .and_then(|selected| {
+                    catalog
+                        .iter()
+                        .position(|playbook| playbook.name.eq_ignore_ascii_case(selected))
+                })
+                .unwrap_or_else(|| editor.selected.min(catalog.len().saturating_sub(1)));
+            editor.name_input.clear();
+            editor.prompt_input.clear();
+            editor.original_custom_name = None;
+            editor.error = None;
+        }
+        self.set_notice(notice);
+    }
+
+    pub fn playbook_write_failed(&mut self, error: impl Into<String>) {
+        if let Some(editor) = &mut self.playbook_editor {
+            editor.error = Some(error.into());
+        }
+    }
+
     pub fn show_review_snapshot(&mut self, snapshot: ReviewSnapshot) {
         let target_url = snapshot.target.url.clone();
         self.ready_reviews.remove(&target_url);
@@ -286,6 +388,7 @@ impl App {
             mode,
             run_kind: ReviewRunKind::ReReview,
             input: String::new(),
+            applied_playbook: None,
             scroll: 0,
             max_scroll: 0,
             error: None,
@@ -519,6 +622,7 @@ impl App {
     }
 
     pub fn close_review_panel(&mut self) {
+        self.playbook_editor = None;
         let Some(panel) = self.review_panel.take() else {
             return;
         };
@@ -546,6 +650,7 @@ impl App {
             mode,
             run_kind: ReviewRunKind::ReReview,
             input: String::new(),
+            applied_playbook: None,
             scroll: 0,
             max_scroll: 0,
             error,
@@ -1007,6 +1112,9 @@ impl App {
     }
 
     fn handle_review_key(&mut self, key: KeyEvent) -> Action {
+        if self.playbook_editor.is_some() {
+            return self.handle_playbook_key(key);
+        }
         let mode = self
             .review_panel
             .as_ref()
@@ -1014,11 +1122,20 @@ impl App {
             .mode;
         match mode {
             ReviewPanelMode::Prompt => match key.code {
+                KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.open_playbook_library();
+                    Action::None
+                }
+                KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.open_save_current_playbook();
+                    Action::None
+                }
                 KeyCode::Esc => {
                     let panel = self.review_panel.as_mut().expect("review panel exists");
                     if panel.snapshot.has_session() || panel.snapshot.has_draft() {
                         panel.mode = ReviewPanelMode::Draft;
                         panel.input.clear();
+                        panel.applied_playbook = None;
                         panel.error = None;
                     } else {
                         self.close_review_panel();
@@ -1053,15 +1170,10 @@ impl App {
                     Action::None
                 }
                 KeyCode::Delete => {
-                    self.review_panel
-                        .as_mut()
-                        .expect("review panel exists")
-                        .input
-                        .clear();
-                    self.review_panel
-                        .as_mut()
-                        .expect("review panel exists")
-                        .error = None;
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.input.clear();
+                    panel.applied_playbook = None;
+                    panel.error = None;
                     Action::None
                 }
                 KeyCode::Char(character)
@@ -1147,6 +1259,7 @@ impl App {
                     panel.mode = ReviewPanelMode::Prompt;
                     panel.run_kind = ReviewRunKind::FollowUp;
                     panel.input.clear();
+                    panel.applied_playbook = None;
                     panel.error = None;
                     Action::None
                 }
@@ -1155,6 +1268,7 @@ impl App {
                     panel.mode = ReviewPanelMode::Prompt;
                     panel.run_kind = ReviewRunKind::ReReview;
                     panel.input.clear();
+                    panel.applied_playbook = None;
                     panel.error = None;
                     Action::None
                 }
@@ -1225,6 +1339,7 @@ impl App {
                     panel.mode = ReviewPanelMode::Prompt;
                     panel.run_kind = ReviewRunKind::NewSession;
                     panel.input.clear();
+                    panel.applied_playbook = None;
                     panel.error = None;
                     Action::None
                 }
@@ -1304,6 +1419,325 @@ impl App {
                 }
                 _ => Action::None,
             },
+        }
+    }
+
+    fn open_playbook_library(&mut self) {
+        let selected = self
+            .review_panel
+            .as_ref()
+            .and_then(|panel| panel.applied_playbook.as_deref())
+            .and_then(|selected| {
+                self.playbook_catalog()
+                    .iter()
+                    .position(|playbook| playbook.name.eq_ignore_ascii_case(selected))
+            })
+            .unwrap_or(0);
+        self.playbook_editor = Some(PlaybookEditor::library(selected));
+        self.playbook_hitboxes = PlaybookHitboxes::default();
+    }
+
+    fn open_save_current_playbook(&mut self) {
+        let prompt = self
+            .review_panel
+            .as_ref()
+            .expect("review panel exists")
+            .input
+            .trim()
+            .to_string();
+        if prompt.is_empty() {
+            self.review_panel
+                .as_mut()
+                .expect("review panel exists")
+                .error = Some("Type review instructions before saving a playbook.".into());
+            return;
+        }
+        self.playbook_editor = Some(PlaybookEditor {
+            mode: PlaybookEditorMode::Name,
+            selected: 0,
+            name_input: String::new(),
+            prompt_input: prompt,
+            original_custom_name: None,
+            error: None,
+        });
+        self.playbook_hitboxes = PlaybookHitboxes::default();
+    }
+
+    fn handle_playbook_key(&mut self, key: KeyEvent) -> Action {
+        let mode = self
+            .playbook_editor
+            .as_ref()
+            .expect("playbook editor exists")
+            .mode;
+        match mode {
+            PlaybookEditorMode::Library => match key.code {
+                KeyCode::Esc => {
+                    self.playbook_editor = None;
+                    Action::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_playbook_selection(-1);
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_playbook_selection(1);
+                    Action::None
+                }
+                KeyCode::Home => {
+                    self.playbook_editor.as_mut().unwrap().selected = 0;
+                    Action::None
+                }
+                KeyCode::End => {
+                    self.playbook_editor.as_mut().unwrap().selected =
+                        self.playbook_catalog().len().saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    self.apply_selected_playbook();
+                    Action::None
+                }
+                KeyCode::Char('n') => {
+                    self.playbook_editor = Some(PlaybookEditor {
+                        mode: PlaybookEditorMode::Name,
+                        selected: 0,
+                        name_input: String::new(),
+                        prompt_input: String::new(),
+                        original_custom_name: None,
+                        error: None,
+                    });
+                    Action::None
+                }
+                KeyCode::Char('e') => {
+                    self.edit_selected_playbook();
+                    Action::None
+                }
+                KeyCode::Char('d') => {
+                    let selected = self.selected_playbook();
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    if selected.as_ref().is_some_and(|playbook| playbook.built_in) {
+                        editor.error = Some(
+                            "Built-in playbooks cannot be deleted; edit one to duplicate it."
+                                .into(),
+                        );
+                    } else if selected.is_some() {
+                        editor.mode = PlaybookEditorMode::ConfirmDelete;
+                        editor.error = None;
+                    }
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            PlaybookEditorMode::Name => match key.code {
+                KeyCode::Esc => {
+                    let selected = self.playbook_editor.as_ref().unwrap().selected;
+                    self.playbook_editor = Some(PlaybookEditor::library(selected));
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    self.continue_playbook_name();
+                    Action::None
+                }
+                KeyCode::Backspace => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.name_input.pop();
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Delete => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.name_input.clear();
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.name_input.push(character);
+                    editor.error = None;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            PlaybookEditorMode::Body => match key.code {
+                KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.save_playbook_action()
+                }
+                KeyCode::Esc => {
+                    let selected = self.playbook_editor.as_ref().unwrap().selected;
+                    self.playbook_editor = Some(PlaybookEditor::library(selected));
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.prompt_input.push('\n');
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Backspace => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.prompt_input.pop();
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Delete => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.prompt_input.clear();
+                    editor.error = None;
+                    Action::None
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.prompt_input.push(character);
+                    editor.error = None;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            PlaybookEditorMode::ConfirmDelete => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.delete_playbook_action(),
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    let editor = self.playbook_editor.as_mut().unwrap();
+                    editor.mode = PlaybookEditorMode::Library;
+                    editor.error = None;
+                    Action::None
+                }
+                _ => Action::None,
+            },
+        }
+    }
+
+    fn selected_playbook(&self) -> Option<ReviewPlaybook> {
+        let selected = self.playbook_editor.as_ref()?.selected;
+        self.playbook_catalog().get(selected).cloned()
+    }
+
+    fn move_playbook_selection(&mut self, delta: isize) {
+        let len = self.playbook_catalog().len();
+        let editor = self.playbook_editor.as_mut().unwrap();
+        if len == 0 {
+            editor.selected = 0;
+            return;
+        }
+        editor.selected = (editor.selected as isize + delta).rem_euclid(len as isize) as usize;
+        editor.error = None;
+    }
+
+    fn apply_selected_playbook(&mut self) {
+        let Some(playbook) = self.selected_playbook() else {
+            return;
+        };
+        let panel = self.review_panel.as_mut().expect("review panel exists");
+        panel.input = playbook.prompt;
+        panel.applied_playbook = Some(playbook.name);
+        panel.error = None;
+        self.playbook_editor = None;
+    }
+
+    fn edit_selected_playbook(&mut self) {
+        let Some(playbook) = self.selected_playbook() else {
+            return;
+        };
+        let selected = self.playbook_editor.as_ref().unwrap().selected;
+        self.playbook_editor = Some(PlaybookEditor {
+            mode: PlaybookEditorMode::Name,
+            selected,
+            name_input: if playbook.built_in {
+                format!("{} copy", playbook.name)
+            } else {
+                playbook.name.clone()
+            },
+            prompt_input: playbook.prompt,
+            original_custom_name: (!playbook.built_in).then_some(playbook.name),
+            error: None,
+        });
+    }
+
+    fn continue_playbook_name(&mut self) {
+        let (name, original) = {
+            let editor = self.playbook_editor.as_ref().unwrap();
+            (
+                editor.name_input.trim().to_string(),
+                editor.original_custom_name.clone(),
+            )
+        };
+        if let Err(error) = playbook::validate_name(&name) {
+            self.playbook_editor.as_mut().unwrap().error = Some(error.to_string());
+            return;
+        }
+        let duplicate = self.playbook_catalog().into_iter().any(|playbook| {
+            playbook.name.eq_ignore_ascii_case(&name)
+                && original
+                    .as_deref()
+                    .is_none_or(|original| !playbook.name.eq_ignore_ascii_case(original))
+        });
+        if duplicate {
+            self.playbook_editor.as_mut().unwrap().error =
+                Some("A playbook with that name already exists.".into());
+            return;
+        }
+        let editor = self.playbook_editor.as_mut().unwrap();
+        editor.name_input = name;
+        editor.mode = PlaybookEditorMode::Body;
+        editor.error = None;
+    }
+
+    fn save_playbook_action(&mut self) -> Action {
+        let editor = self.playbook_editor.as_ref().unwrap();
+        let playbook = match ReviewPlaybook::custom(&editor.name_input, &editor.prompt_input) {
+            Ok(playbook) => playbook,
+            Err(error) => {
+                self.playbook_editor.as_mut().unwrap().error = Some(error.to_string());
+                return Action::None;
+            }
+        };
+        let original = editor.original_custom_name.clone();
+        let mut playbooks = self.custom_playbooks.clone();
+        if let Some(original) = original {
+            let Some(index) = playbooks
+                .iter()
+                .position(|existing| existing.name.eq_ignore_ascii_case(&original))
+            else {
+                self.playbook_editor.as_mut().unwrap().error =
+                    Some("The playbook being edited no longer exists.".into());
+                return Action::None;
+            };
+            playbooks[index] = playbook.clone();
+        } else {
+            playbooks.push(playbook.clone());
+        }
+        if let Err(error) = playbook::validate_custom_playbooks(&playbooks) {
+            self.playbook_editor.as_mut().unwrap().error = Some(error.to_string());
+            return Action::None;
+        }
+        Action::SavePlaybooks {
+            playbooks,
+            selected_name: Some(playbook.name.clone()),
+            notice: format!("Saved review playbook: {}", playbook.name),
+        }
+    }
+
+    fn delete_playbook_action(&mut self) -> Action {
+        let Some(selected) = self.selected_playbook() else {
+            return Action::None;
+        };
+        if selected.built_in {
+            self.playbook_editor.as_mut().unwrap().error =
+                Some("Built-in playbooks cannot be deleted.".into());
+            return Action::None;
+        }
+        let mut playbooks = self.custom_playbooks.clone();
+        playbooks.retain(|playbook| !playbook.name.eq_ignore_ascii_case(&selected.name));
+        Action::SavePlaybooks {
+            playbooks,
+            selected_name: None,
+            notice: format!("Deleted review playbook: {}", selected.name),
         }
     }
 
@@ -1404,6 +1838,9 @@ impl App {
         if self.show_help {
             return Action::None;
         }
+        if self.playbook_editor.is_some() {
+            return self.handle_playbook_mouse(mouse);
+        }
         if self.review_panel.is_some() {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_review(-3),
@@ -1459,6 +1896,80 @@ impl App {
                         .selected_url()
                         .map(Action::Open)
                         .unwrap_or(Action::None);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn handle_playbook_mouse(&mut self, mouse: MouseEvent) -> Action {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self
+                    .playbook_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.mode == PlaybookEditorMode::Library)
+                {
+                    self.move_playbook_selection(-1);
+                }
+                Action::None
+            }
+            MouseEventKind::ScrollDown => {
+                if self
+                    .playbook_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.mode == PlaybookEditorMode::Library)
+                {
+                    self.move_playbook_selection(1);
+                }
+                Action::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let x = mouse.column;
+                let y = mouse.row;
+                let hitboxes = self.playbook_hitboxes.clone();
+                if let Some(hitbox) = hitboxes
+                    .rows
+                    .iter()
+                    .find(|hitbox| contains(hitbox.rect, x, y))
+                {
+                    if let Some(editor) = &mut self.playbook_editor {
+                        editor.selected = hitbox.index;
+                        editor.error = None;
+                    }
+                    return Action::None;
+                }
+                let mode = self.playbook_editor.as_ref().unwrap().mode;
+                if contains(hitboxes.primary, x, y) {
+                    return self.handle_playbook_key(match mode {
+                        PlaybookEditorMode::Body => {
+                            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+                        }
+                        _ => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    });
+                }
+                if contains(hitboxes.new, x, y) {
+                    return self.handle_playbook_key(KeyEvent::new(
+                        KeyCode::Char('n'),
+                        KeyModifiers::NONE,
+                    ));
+                }
+                if contains(hitboxes.edit, x, y) {
+                    return self.handle_playbook_key(KeyEvent::new(
+                        KeyCode::Char('e'),
+                        KeyModifiers::NONE,
+                    ));
+                }
+                if contains(hitboxes.delete, x, y) {
+                    return self.handle_playbook_key(KeyEvent::new(
+                        KeyCode::Char('d'),
+                        KeyModifiers::NONE,
+                    ));
+                }
+                if contains(hitboxes.back, x, y) {
+                    return self
+                        .handle_playbook_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 }
                 Action::None
             }
@@ -1638,6 +2149,10 @@ mod tests {
 
     fn shifted_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn control_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -1847,6 +2362,139 @@ mod tests {
                 mode: LaunchMode::Review(ReviewRunKind::ReReview),
                 focus: Some("race conditions".into()),
             }
+        );
+    }
+
+    #[test]
+    fn review_playbooks_are_selected_as_editable_focus_without_auto_launching() {
+        let mut app = app();
+        let snapshot = review_snapshot(false, false);
+        app.show_review_snapshot(snapshot.clone());
+
+        assert_eq!(
+            app.handle_key(control_key(KeyCode::Char('p'))),
+            Action::None
+        );
+        assert_eq!(
+            app.playbook_editor.as_ref().unwrap().mode,
+            PlaybookEditorMode::Library
+        );
+        assert_eq!(app.playbook_catalog().len(), 4);
+        assert_eq!(app.handle_key(key(KeyCode::Down)), Action::None);
+        let selected = app.playbook_catalog()[1].clone();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(app.playbook_editor.is_none());
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.input, selected.prompt);
+        assert_eq!(
+            panel.applied_playbook.as_deref(),
+            Some(selected.name.as_str())
+        );
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target,
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                focus: Some(selected.prompt),
+            }
+        );
+    }
+
+    #[test]
+    fn custom_playbooks_can_be_named_saved_reused_and_deleted() {
+        let mut app = app();
+        app.show_review_snapshot(review_snapshot(false, false));
+        for character in "Check feature flags and rollback safety.".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            app.handle_key(control_key(KeyCode::Char('s'))),
+            Action::None
+        );
+        assert_eq!(
+            app.playbook_editor.as_ref().unwrap().mode,
+            PlaybookEditorMode::Name
+        );
+        for character in "Release safety".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(
+            app.playbook_editor.as_ref().unwrap().mode,
+            PlaybookEditorMode::Body
+        );
+        app.handle_key(key(KeyCode::Enter));
+        for character in "Check mixed-version deployment behavior.".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        let expected_prompt =
+            "Check feature flags and rollback safety.\nCheck mixed-version deployment behavior.";
+        let (playbooks, selected_name, notice) =
+            match app.handle_key(control_key(KeyCode::Char('s'))) {
+                Action::SavePlaybooks {
+                    playbooks,
+                    selected_name,
+                    notice,
+                } => (playbooks, selected_name, notice),
+                action => panic!("expected playbook save, got {action:?}"),
+            };
+        assert_eq!(playbooks.len(), 1);
+        assert_eq!(playbooks[0].name, "Release safety");
+        assert_eq!(playbooks[0].prompt, expected_prompt);
+        app.playbooks_saved(playbooks, selected_name, notice);
+        assert_eq!(app.playbook_catalog().len(), 5);
+        assert_eq!(app.playbook_editor.as_ref().unwrap().selected, 4);
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(app.review_panel.as_ref().unwrap().input, expected_prompt);
+
+        app.handle_key(control_key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.handle_key(key(KeyCode::Char('d'))), Action::None);
+        assert_eq!(
+            app.playbook_editor.as_ref().unwrap().mode,
+            PlaybookEditorMode::ConfirmDelete
+        );
+        let (playbooks, selected_name, notice) = match app.handle_key(key(KeyCode::Enter)) {
+            Action::SavePlaybooks {
+                playbooks,
+                selected_name,
+                notice,
+            } => (playbooks, selected_name, notice),
+            action => panic!("expected playbook deletion, got {action:?}"),
+        };
+        assert!(playbooks.is_empty());
+        app.playbooks_saved(playbooks, selected_name, notice);
+        assert_eq!(app.playbook_catalog().len(), 4);
+    }
+
+    #[test]
+    fn playbook_validation_and_built_in_protection_are_visible_in_the_flow() {
+        let mut app = app();
+        app.show_review_snapshot(review_snapshot(false, false));
+        assert_eq!(
+            app.handle_key(control_key(KeyCode::Char('s'))),
+            Action::None
+        );
+        assert!(
+            app.review_panel
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Type review instructions"))
+        );
+
+        app.handle_key(control_key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char('d')));
+        let editor = app.playbook_editor.as_ref().unwrap();
+        assert_eq!(editor.mode, PlaybookEditorMode::Library);
+        assert!(
+            editor
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cannot be deleted"))
         );
     }
 

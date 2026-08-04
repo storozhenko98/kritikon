@@ -14,7 +14,7 @@ It keeps the three queues that matter in one calm interface:
 2. **Involved** — open PRs you committed to, reviewed, commented on, were assigned to, or were mentioned in.
 3. **My PRs** — every open PR you authored, including drafts and PRs with no reviews.
 
-When you want a second set of eyes, `Shift+R` can optionally start a PR-scoped OpenCode review. It runs headlessly in the background while Kritikon stays fully usable, preserves one resumable session per PR, lets you attach or detach the real OpenCode TUI, and renders the resulting Markdown for your review before Kritikon can post anything. Follow-ups revise the last good draft without discarding it while the agent works. OpenCode is not required for the normal dashboard.
+When you want a second set of eyes, `Shift+R` can optionally start a PR-scoped OpenCode review. It runs headlessly in the background while Kritikon stays fully usable, preserves one resumable session per PR, lets you attach or detach the real OpenCode TUI, and renders the resulting Markdown for your review before Kritikon can post anything. Follow-ups revise the last good draft without discarding it while the agent works. Reusable review playbooks let you save specialized focus such as authorization, migrations, API compatibility, or your own team's concerns without weakening Kritikon's mandatory review and submission safeguards. OpenCode is not required for the normal dashboard.
 
 The list stays compact while the selected PR shows its full review breakdown, outstanding reviewers, draft/ready state, mergeability, CI rollup, branches, files, line changes, comments, labels, and timestamps. Closed PRs are never queried.
 
@@ -73,6 +73,7 @@ An unavailable or slow network never blocks the dashboard for more than three se
 | Copy selected PR's head branch | `c` | — |
 | Copy selected PR's URL | `Shift+C` | — |
 | Start/inspect resumable background OpenCode review | `Shift+R` | — |
+| Open/save review playbooks from a focus editor | `Ctrl+P` / `Ctrl+S` | Click library controls |
 | Expand/collapse details | `d` or `Esc`; arrows/PgUp/PgDn scroll | Wheel/trackpad |
 | Configure refresh timer | `t` | Click editor controls |
 | Refresh now | `r` | — |
@@ -98,7 +99,7 @@ KRITIKON_OPENCODE_MODEL=opencode/gpt-5.4 kritikon
 On a PR with no saved agent session:
 
 1. Press `Shift+R`.
-2. Leave the focus field blank to use Kritikon's thorough review template, or type additional instructions such as `focus on cancellation and data-loss paths`.
+2. Leave the focus field blank to use Kritikon's thorough review template, type one-off instructions such as `focus on cancellation and data-loss paths`, or press `Ctrl+P` to load an editable review playbook.
 3. Press `Enter`. Kritikon immediately queues the work in the background and remains responsive while it prepares the managed scratch checkout and runs OpenCode headlessly.
 4. Press `Esc` to use the rest of the dashboard while the review runs. The footer keeps the background-job count visible and marks completed drafts as ready.
 5. Press `Shift+R` on that PR to inspect progress. Once its session is ready, press `o` to attach the real OpenCode TUI if you want to watch or intervene. In OpenCode, press `Ctrl+X`, then `Q` (or run `/exit`) to detach the client and return to Kritikon without stopping the background worker.
@@ -115,7 +116,27 @@ The draft view supports:
 - `o` — attach the full OpenCode TUI to a running review, or reopen the saved chat after completion, without automatically sending another review prompt.
 - `p` — choose **Approve**, **Comment**, or **Request changes**, then pass a separate confirmation screen before Kritikon invokes `gh pr review`.
 
-OpenCode context is preserved by session ID per PR. Reopening the same PR—even after a later review request—continues the prior conversation. Before every run, Kritikon refreshes its disposable checkout to the latest PR head. A clean re-review clears the prior draft artifact; a follow-up supplies that draft as revision context and preserves the saved copy until a valid replacement exists. Active reviews use a password-protected OpenCode server bound only to `127.0.0.1`; the headless worker and optional TUI are separate clients of that server, which is why detaching the TUI does not interrupt the review.
+### Review playbooks
+
+Review playbooks are named, reusable focus instructions. They augment Kritikon's protected base prompt: the agent must still inspect the actual diff, prioritize correctness and regressions, operate without editing product code, write the proposed Markdown file, and leave GitHub submission to Kritikon's explicit preview-and-confirm flow.
+
+From any review focus editor:
+
+- `Ctrl+P` opens the playbook library. Use `↑` / `↓` or `j` / `k` to select, then `Enter` to load an editable copy into the current review. A click selects a row, and the visible **Use** button applies it.
+- `Ctrl+S` starts saving the current non-empty focus as a custom playbook.
+- In the library, `n` creates a playbook, `e` edits a custom playbook or duplicates a read-only built-in, and `d` opens deletion confirmation for a custom playbook.
+- The name editor validates a unique name of at most 48 characters. `Enter` continues without saving.
+- The instructions editor accepts multiple lines: `Enter` inserts a newline and `Ctrl+S` validates and saves. Instructions must be non-empty and at most 8,000 characters.
+- Selecting a playbook never launches a review. Its text remains editable, and the usual final `Enter` is still required to queue the agent.
+
+Kritikon includes four read-only playbooks: **Security & authorization**, **Database migrations**, **API compatibility**, and **Performance & concurrency**. Editing a built-in creates a custom copy so the shipped version remains recoverable.
+
+Custom playbooks are written atomically with user-only permissions to a separate file, so resetting refresh configuration does not delete them:
+
+- macOS: `~/Library/Application Support/kritikon/playbooks.toml`
+- Linux: `$XDG_CONFIG_HOME/kritikon/playbooks.toml`, or `~/.config/kritikon/playbooks.toml` when `XDG_CONFIG_HOME` is unset or relative.
+
+OpenCode context is preserved by session ID per PR. Reopening the same PR—even after a later review request—continues the prior conversation. Before every run, Kritikon refreshes its disposable checkout to the latest PR head. A clean re-review clears the prior draft artifact; a follow-up supplies that draft as revision context and preserves the saved copy until a valid replacement exists. One-off focus and selected playbooks are appended to the complete baseline review instructions rather than replacing them. Active reviews use a password-protected OpenCode server bound only to `127.0.0.1`; the headless worker and optional TUI are separate clients of that server, which is why detaching the TUI does not interrupt the review.
 
 Session records and drafts use native data directories:
 
@@ -128,7 +149,7 @@ Repository checkouts live under the operating system's temporary directory in `k
 
 ## Configuration
 
-Press `t` in the TUI to configure the refresh timer with either keyboard or mouse:
+Press `t` in the TUI to configure the refresh timer with either keyboard or mouse. This configuration is deliberately separate from custom review playbooks:
 
 - Type a whole-number refresh interval in seconds.
 - Press `Enter` or `s`, or click **Save**, to validate and persist changes.
@@ -158,7 +179,7 @@ kritikon --refresh-seconds 60
 kritikon --refresh-seconds 5
 ```
 
-Delete the saved file without opening the TUI:
+Delete only the saved refresh configuration without opening the TUI; custom playbooks remain intact:
 
 ```bash
 kritikon --reset-config

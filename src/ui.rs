@@ -8,7 +8,10 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, ConfigFocus, ReviewAgentState, ReviewPanelMode, ReviewRunPhase, RowHitbox, Tab},
+    app::{
+        App, ConfigFocus, PlaybookEditorMode, ReviewAgentState, ReviewPanelMode, ReviewRunPhase,
+        RowHitbox, Tab,
+    },
     config::MIN_REFRESH_SECONDS,
     model::{
         CheckState, DisplayReviewState, MergeableState, PullRequest, ReviewState, ReviewerKind,
@@ -44,6 +47,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.review_panel.is_some() {
         render_review_panel(frame, area, app);
+    }
+    if app.playbook_editor.is_some() {
+        render_playbook_editor(frame, area, app);
     }
 }
 
@@ -942,6 +948,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let snapshot = panel.snapshot.clone();
     let run_kind = panel.run_kind;
     let input = panel.input.clone();
+    let applied_playbook = panel.applied_playbook.clone();
     let error = panel.error.clone();
     let scroll = panel.scroll;
 
@@ -1084,7 +1091,14 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     "Add optional guidance for the new session…",
                 ),
             };
-            render_review_focus_editor(frame, chunks[2], &input, editor_title, placeholder);
+            render_review_focus_editor(
+                frame,
+                chunks[2],
+                &input,
+                editor_title,
+                placeholder,
+                applied_playbook.as_deref(),
+            );
         }
         ReviewPanelMode::Running(phase) => {
             let (status, detail, color) = match phase {
@@ -1372,6 +1386,7 @@ fn render_review_focus_editor(
     input: &str,
     base_title: &str,
     placeholder: &str,
+    applied_playbook: Option<&str>,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1390,25 +1405,25 @@ fn render_review_focus_editor(
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(rows[0]);
 
-    let editor_line = if input.is_empty() {
-        Line::from(vec![
+    let editor_text = if input.is_empty() {
+        Text::from(Line::from(vec![
             Span::styled("▌", Style::default().fg(ACCENT)),
             Span::styled(
                 format!(" {placeholder}"),
                 Style::default().fg(Color::DarkGray),
             ),
-        ])
+        ]))
     } else {
-        Line::from(vec![
-            Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(ACCENT)),
-        ])
+        Text::from(format!("{input}▌"))
     };
-    let editor = Paragraph::new(editor_line).wrap(Wrap { trim: false });
+    let editor = Paragraph::new(editor_text).wrap(Wrap { trim: false });
     let line_count = editor.line_count(columns[1].width).max(1) as u16;
     let visible_lines = columns[1].height.max(1);
     let scroll = line_count.saturating_sub(visible_lines);
     let character_count = input.chars().count();
+    let base_title = applied_playbook
+        .map(|playbook| format!("{base_title} · {playbook}"))
+        .unwrap_or_else(|| base_title.to_string());
     let title = if input.is_empty() {
         format!(" {base_title} ")
     } else if scroll > 0 {
@@ -1443,11 +1458,13 @@ fn render_review_focus_editor(
             Line::from(vec![
                 Span::styled("Enter", Style::default().fg(ACCENT)),
                 Span::styled(" run in background", Style::default().fg(MUTED)),
-                Span::styled("  ·  Esc", Style::default().fg(ACCENT)),
-                Span::styled(" cancel", Style::default().fg(MUTED)),
+                Span::styled("  ·  Ctrl+P", Style::default().fg(ACCENT)),
+                Span::styled(" playbooks", Style::default().fg(MUTED)),
+                Span::styled("  ·  Ctrl+S", Style::default().fg(ACCENT)),
+                Span::styled(" save", Style::default().fg(MUTED)),
             ]),
             Line::from(Span::styled(
-                "Backspace edit  ·  Delete clear",
+                "Backspace edit  ·  Delete clear  ·  Esc cancel",
                 Style::default().fg(MUTED),
             )),
         ])
@@ -1490,6 +1507,435 @@ fn markdown_lines(source: &str) -> Vec<Line<'static>> {
             Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
         })
         .collect()
+}
+
+fn render_playbook_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(editor) = app.playbook_editor.clone() else {
+        return;
+    };
+    let catalog = app.playbook_catalog();
+    app.playbook_hitboxes = Default::default();
+    let width = 96.min(area.width.saturating_sub(2));
+    let height = 32.min(area.height.saturating_sub(2));
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Review playbooks ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(popup).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    frame.render_widget(block, popup);
+
+    if editor.mode == PlaybookEditorMode::ConfirmDelete {
+        let selected = catalog.get(editor.selected);
+        let lines = vec![
+            Line::from(Span::styled(
+                "Delete this custom playbook?",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(
+                selected.map_or("Unknown playbook", |playbook| playbook.name.as_str()),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::raw("The playbook file is updated only after you confirm."),
+            Line::raw("This does not change the text already loaded into the current review."),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "y / Enter delete  ·  n / Esc keep it",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(Block::default().padding(ratatui::widgets::Padding::new(2, 2, 2, 1))),
+            inner,
+        );
+        app.playbook_hitboxes.primary = Rect::new(
+            inner.x,
+            inner.bottom().saturating_sub(4),
+            inner.width / 2,
+            3,
+        );
+        app.playbook_hitboxes.back = Rect::new(
+            inner.x + inner.width / 2,
+            inner.bottom().saturating_sub(4),
+            inner.width - inner.width / 2,
+            3,
+        );
+        let buttons = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(Rect::new(
+                inner.x,
+                inner.bottom().saturating_sub(4),
+                inner.width,
+                3,
+            ));
+        render_config_button(frame, buttons[0], "Delete", true, Color::Red);
+        render_config_button(frame, buttons[1], "Keep", false, MUTED);
+        return;
+    }
+
+    match editor.mode {
+        PlaybookEditorMode::Library => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(10),
+                    Constraint::Length(2),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Reusable review focus, without weakening Kritikon's protected base prompt.",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "Enter or click Use loads an editable copy; it never starts a review by itself.",
+                        Style::default().fg(MUTED),
+                    )),
+                ]),
+                rows[0],
+            );
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+                .split(rows[1]);
+            let list_inner = Block::default()
+                .title(format!(
+                    " {} built-in · {} custom ",
+                    catalog.iter().filter(|playbook| playbook.built_in).count(),
+                    catalog.iter().filter(|playbook| !playbook.built_in).count()
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .inner(columns[0])
+                .inner(Margin {
+                    horizontal: 1,
+                    vertical: 0,
+                });
+            frame.render_widget(
+                Block::default()
+                    .title(format!(
+                        " {} built-in · {} custom ",
+                        catalog.iter().filter(|playbook| playbook.built_in).count(),
+                        catalog.iter().filter(|playbook| !playbook.built_in).count()
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+                columns[0],
+            );
+            let visible = usize::from(list_inner.height / 2).max(1);
+            let start = editor
+                .selected
+                .saturating_add(1)
+                .saturating_sub(visible)
+                .min(catalog.len().saturating_sub(visible));
+            for (visible_index, (index, playbook)) in catalog
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+                .enumerate()
+            {
+                let rect = Rect::new(
+                    list_inner.x,
+                    list_inner.y + visible_index as u16 * 2,
+                    list_inner.width,
+                    2.min(list_inner.height.saturating_sub(visible_index as u16 * 2)),
+                );
+                app.playbook_hitboxes.rows.push(RowHitbox { rect, index });
+                let selected = index == editor.selected;
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(vec![
+                            Span::styled(
+                                if selected { "› " } else { "  " },
+                                Style::default().fg(ACCENT),
+                            ),
+                            Span::styled(
+                                playbook.name.clone(),
+                                Style::default().add_modifier(if selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                            ),
+                        ]),
+                        Line::from(Span::styled(
+                            if playbook.built_in {
+                                "  BUILT-IN"
+                            } else {
+                                "  CUSTOM"
+                            },
+                            Style::default().fg(if playbook.built_in {
+                                Color::Blue
+                            } else {
+                                Color::Green
+                            }),
+                        )),
+                    ])
+                    .style(if selected {
+                        Style::default().bg(Color::Rgb(34, 50, 54))
+                    } else {
+                        Style::default()
+                    }),
+                    rect,
+                );
+            }
+
+            let selected = catalog.get(editor.selected);
+            let preview = selected
+                .map(|playbook| {
+                    vec![
+                        Line::from(Span::styled(
+                            playbook.name.clone(),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::raw(""),
+                        Line::from(playbook.prompt.clone()),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Applied after Kritikon's mandatory review and safety instructions.",
+                            Style::default().fg(MUTED),
+                        )),
+                    ]
+                })
+                .unwrap_or_default();
+            frame.render_widget(
+                Paragraph::new(preview).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .title(" Selected instructions ")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .padding(ratatui::widgets::Padding::horizontal(1)),
+                ),
+                columns[1],
+            );
+
+            let message = editor
+                .error
+                .as_deref()
+                .or(app.playbook_warning.as_deref())
+                .unwrap_or("Built-ins are read-only. Editing one creates a custom copy.");
+            let message_color = if editor.error.is_some() || app.playbook_warning.is_some() {
+                Color::Yellow
+            } else {
+                MUTED
+            };
+            frame.render_widget(
+                Paragraph::new(message)
+                    .style(Style::default().fg(message_color))
+                    .wrap(Wrap { trim: true }),
+                rows[2],
+            );
+
+            let buttons = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                ])
+                .split(rows[3]);
+            app.playbook_hitboxes.primary = buttons[0];
+            app.playbook_hitboxes.new = buttons[1];
+            app.playbook_hitboxes.edit = buttons[2];
+            app.playbook_hitboxes.delete = buttons[3];
+            app.playbook_hitboxes.back = buttons[4];
+            render_config_button(frame, buttons[0], "Use", true, ACCENT);
+            render_config_button(frame, buttons[1], "New", false, Color::Green);
+            render_config_button(frame, buttons[2], "Edit / copy", false, Color::Blue);
+            render_config_button(frame, buttons[3], "Delete", false, Color::Red);
+            render_config_button(frame, buttons[4], "Back", false, MUTED);
+            frame.render_widget(
+                Paragraph::new(
+                    "↑↓/jk select · Enter use · n new · e edit/copy · d delete · Esc back · mouse supported",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED)),
+                rows[4],
+            );
+        }
+        PlaybookEditorMode::Name => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(5),
+                    Constraint::Length(3),
+                    Constraint::Min(2),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        if editor.original_custom_name.is_some() {
+                            "Rename the custom review playbook"
+                        } else {
+                            "Name the custom review playbook"
+                        },
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(""),
+                    Line::raw("Names are unique and may contain up to 48 characters."),
+                    Line::from(Span::styled(
+                        "Enter continues to the multiline instructions editor; nothing is saved yet.",
+                        Style::default().fg(MUTED),
+                    )),
+                ]),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(format!("{}▌", editor.name_input)).block(
+                    Block::default()
+                        .title(" Playbook name ")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(ACCENT)),
+                ),
+                rows[1],
+            );
+            if let Some(error) = &editor.error {
+                frame.render_widget(
+                    Paragraph::new(error.clone())
+                        .style(Style::default().fg(Color::Red))
+                        .wrap(Wrap { trim: true }),
+                    rows[2],
+                );
+            }
+            let buttons = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(rows[3]);
+            app.playbook_hitboxes.primary = buttons[0];
+            app.playbook_hitboxes.back = buttons[1];
+            render_config_button(frame, buttons[0], "Continue", true, ACCENT);
+            render_config_button(frame, buttons[1], "Back", false, MUTED);
+            frame.render_widget(
+                Paragraph::new(
+                    "Type name · Enter continue · Backspace edit · Delete clear · Esc back",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED)),
+                rows[4],
+            );
+        }
+        PlaybookEditorMode::Body => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(10),
+                    Constraint::Length(2),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        format!("Edit instructions · {}", editor.name_input),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "These instructions augment the protected base prompt and remain editable when selected.",
+                        Style::default().fg(MUTED),
+                    )),
+                ]),
+                rows[0],
+            );
+            render_multiline_editor(
+                frame,
+                rows[1],
+                &editor.prompt_input,
+                " Playbook instructions ",
+                "Describe the reusable review focus…",
+            );
+            if let Some(error) = &editor.error {
+                frame.render_widget(
+                    Paragraph::new(error.clone())
+                        .style(Style::default().fg(Color::Red))
+                        .wrap(Wrap { trim: true }),
+                    rows[2],
+                );
+            } else {
+                frame.render_widget(
+                    Paragraph::new("Up to 8,000 characters · Enter inserts a new line")
+                        .style(Style::default().fg(MUTED)),
+                    rows[2],
+                );
+            }
+            let buttons = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(rows[3]);
+            app.playbook_hitboxes.primary = buttons[0];
+            app.playbook_hitboxes.back = buttons[1];
+            render_config_button(frame, buttons[0], "Save playbook", true, Color::Green);
+            render_config_button(frame, buttons[1], "Discard edits", false, MUTED);
+            frame.render_widget(
+                Paragraph::new(
+                    "Ctrl+S save · Enter newline · Backspace edit · Delete clear · Esc discard",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED)),
+                rows[4],
+            );
+        }
+        PlaybookEditorMode::ConfirmDelete => unreachable!(),
+    }
+}
+
+fn render_multiline_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input: &str,
+    title: &str,
+    placeholder: &str,
+) {
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let text = if input.is_empty() {
+        Text::from(Line::from(vec![
+            Span::styled("▌", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!(" {placeholder}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    } else {
+        Text::from(format!("{input}▌"))
+    };
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let line_count = paragraph.line_count(inner.width).max(1) as u16;
+    let scroll = line_count.saturating_sub(inner.height.max(1));
+    frame.render_widget(block, area);
+    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
 }
 
 fn render_config(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -1995,6 +2441,149 @@ mod tests {
         assert!(rendered.contains("permission auto-approval"));
         assert!(rendered.contains("Optional focus"));
         assert!(rendered.contains("Enter run in background"));
+        assert!(rendered.contains("Ctrl+P playbooks"));
+        assert!(rendered.contains("Ctrl+S save"));
+    }
+
+    #[test]
+    fn playbook_library_renders_builtins_customs_and_mouse_selection() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.set_custom_playbooks(
+            vec![
+                crate::playbook::ReviewPlaybook::custom(
+                    "Release safety",
+                    "Check flags, rollback behavior, and mixed-version deployment.",
+                )
+                .unwrap(),
+            ],
+            None,
+        );
+        app.show_review_snapshot(review_snapshot(false, false));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Review playbooks"));
+        assert!(rendered.contains("4 built-in · 1 custom"));
+        assert!(rendered.contains("Security & authorization"));
+        assert!(rendered.contains("Release safety"));
+        assert!(rendered.contains("protected base prompt"));
+        assert!(rendered.contains("Enter use"));
+        assert_eq!(app.playbook_hitboxes.rows.len(), 5);
+
+        let custom_row = app
+            .playbook_hitboxes
+            .rows
+            .iter()
+            .find(|hitbox| hitbox.index == 4)
+            .unwrap()
+            .rect;
+        assert_eq!(
+            app.handle_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                column: custom_row.x,
+                row: custom_row.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }),
+            crate::app::Action::None
+        );
+        let use_button = app.playbook_hitboxes.primary;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: use_button.x,
+            row: use_button.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(app.playbook_editor.is_none());
+        assert_eq!(
+            app.review_panel
+                .as_ref()
+                .unwrap()
+                .applied_playbook
+                .as_deref(),
+            Some("Release safety")
+        );
+    }
+
+    #[test]
+    fn playbook_creation_explains_naming_multiline_editing_and_safe_storage() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(false, false));
+        app.review_panel.as_mut().unwrap().input = "Check rollout safety.".into();
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let naming = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(naming.contains("Name the custom review playbook"));
+        assert!(naming.contains("nothing is saved yet"));
+        assert!(naming.contains("Continue"));
+
+        for character in "Deploy safety".chars() {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let body = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("Edit instructions · Deploy safety"));
+        assert!(body.contains("Check rollout safety."));
+        assert!(body.contains("protected base prompt"));
+        assert!(body.contains("Ctrl+S save"));
+        assert!(body.contains("Enter newline"));
     }
 
     #[test]

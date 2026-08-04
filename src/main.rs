@@ -5,6 +5,7 @@ mod config;
 mod dev;
 mod github;
 mod model;
+mod playbook;
 mod review_agent;
 mod ui;
 mod updater;
@@ -152,9 +153,20 @@ fn run_tui(
     source: DataSource,
     config_error: Option<String>,
 ) -> Result<()> {
+    let playbook_store = playbook::PlaybookStore::beside_config(store.path())?;
+    let (custom_playbooks, playbook_warning) = match playbook_store.load_or_default() {
+        Ok(playbooks) => (playbooks, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!(
+                "Saved playbooks could not be loaded; built-ins remain available. {error:#}"
+            )),
+        ),
+    };
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
     let mut app = App::new(settings, store.path().to_path_buf(), source);
+    app.set_custom_playbooks(custom_playbooks, playbook_warning);
     let mut review_coordinator = review_agent::ReviewCoordinator::system()?;
     #[cfg(debug_assertions)]
     let mut development_review_events = Vec::<(Instant, review_agent::ReviewEvent)>::new();
@@ -330,6 +342,16 @@ fn run_tui(
                         Err(error) => app.review_failed(format!("{error:#}")),
                     }
                 }
+                Action::SavePlaybooks {
+                    playbooks,
+                    selected_name,
+                    notice,
+                } => match playbook_store.save(&playbooks) {
+                    Ok(()) => app.playbooks_saved(playbooks, selected_name, notice),
+                    Err(error) => app.playbook_write_failed(format!(
+                        "Could not save review playbooks: {error:#}"
+                    )),
+                },
                 Action::SaveConfig(config) => match store.save(&config) {
                     Ok(()) => app.apply_config(config, false),
                     Err(error) => app.config_write_failed(format!("Could not save: {error:#}")),

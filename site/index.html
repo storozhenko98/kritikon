@@ -4,11 +4,11 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#101518">
-    <meta name="description" content="A terminal command center for GitHub pull requests with optional, detachable OpenCode review agents.">
+    <meta name="description" content="A terminal command center for GitHub pull requests with detachable OpenCode review agents and reusable review playbooks.">
     <link rel="canonical" href="https://storozhenko98.github.io/kritikon/">
     <meta property="og:type" content="website">
     <meta property="og:title" content="Kritikon — attention for the review queue">
-    <meta property="og:description" content="See every open PR that needs you, then optionally run a resumable OpenCode review in the background.">
+    <meta property="og:description" content="See every open PR that needs you, then run resumable OpenCode reviews with reusable custom playbooks.">
     <meta property="og:url" content="https://storozhenko98.github.io/kritikon/">
     <meta property="og:image" content="https://storozhenko98.github.io/kritikon/og.png">
     <meta property="og:image:width" content="1200">
@@ -16,7 +16,7 @@
     <meta property="og:image:alt" content="Kritikon — Attention for the review queue.">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="Kritikon — attention for the review queue">
-    <meta name="twitter:description" content="A focused GitHub PR command center with optional background OpenCode reviews.">
+    <meta name="twitter:description" content="A focused GitHub PR command center with background OpenCode reviews and reusable playbooks.">
     <meta name="twitter:image" content="https://storozhenko98.github.io/kritikon/og.png">
     <title>Kritikon — attention for the review queue</title>
     <link rel="stylesheet" href="styles.css">
@@ -43,7 +43,7 @@
           <p class="lede">
             Kritikon turns GitHub pull requests into one calm command center:
             what needs your review, what you have touched, and what is happening on your own PRs.
-            OpenCode support is optional: send any PR to a resumable reviewer that works in the background while the dashboard stays yours.
+            OpenCode support is optional: send any PR to a resumable reviewer that works in the background, then reuse your own review playbooks while the dashboard stays yours.
           </p>
 
           <div class="hero-actions">
@@ -93,7 +93,7 @@
               <div>Review&nbsp;&nbsp; <strong class="danger">CHANGES REQUESTED</strong></div>
               <div>Status&nbsp;&nbsp;&nbsp; Mergeable · CI Passing · awaiting 2</div>
             </div>
-            <div class="agent-status">OpenCode: 1 background review running · dashboard remains interactive</div>
+            <div class="agent-status">Playbook: Security &amp; authorization · OpenCode review running in background</div>
             <div class="shortcuts">↑↓ move&nbsp;&nbsp; Tab views&nbsp;&nbsp; Enter open&nbsp;&nbsp; c branch&nbsp;&nbsp; Shift+C URL&nbsp;&nbsp; Shift+R review agent</div>
           </div>
         </div>
@@ -134,8 +134,8 @@
           </article>
           <article>
             <span class="feature-number">05</span>
-            <h3>Optional OpenCode reviewer</h3>
-            <p>Run a PR-scoped review in the background, follow up without losing the last good draft, or start clean. Attach or detach its live OpenCode TUI whenever you want; every draft is previewed before an explicit post.</p>
+            <h3>OpenCode review playbooks</h3>
+            <p>Run a PR-scoped review in the background, follow up without losing the last good draft, or start clean. Save custom review playbooks, edit them before each run, and attach or detach the live OpenCode TUI whenever you want. Every draft is previewed before an explicit post.</p>
           </article>
           <article>
             <span class="feature-number">06</span>

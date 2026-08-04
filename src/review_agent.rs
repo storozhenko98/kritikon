@@ -1156,15 +1156,19 @@ fn workspace_previous_draft_path(workspace: &Path) -> PathBuf {
 }
 
 fn review_prompt(target: &ReviewTarget, kind: ReviewRunKind, focus: &str) -> String {
+    const BASE_REVIEW_FOCUS: &str = "Apply a thorough, evidence-based review. Prioritize correctness, regressions, security, data loss, concurrency, and missing tests.";
     let task = if kind == ReviewRunKind::FollowUp {
         format!(
-            "This is a follow-up on the existing proposed review stored at `.kritikon/previous-review.md`. Read that complete draft, revisit the code and evidence needed to address the user's follow-up below, and produce a complete revised review. Preserve still-valid findings; correct, remove, or expand them only when the evidence supports it.\n\nUser follow-up:\n{}",
+            "This is a follow-up on the existing proposed review stored at `.kritikon/previous-review.md`. Read that complete draft, revisit the code and evidence needed to address the user's follow-up below, and produce a complete revised review. Preserve still-valid findings; correct, remove, or expand them only when the evidence supports it.\n\n{BASE_REVIEW_FOCUS}\n\nUser follow-up:\n{}",
             focus.trim()
         )
     } else if focus.trim().is_empty() {
-        "Apply a thorough, evidence-based review. Prioritize correctness, regressions, security, data loss, concurrency, and missing tests.".into()
+        BASE_REVIEW_FOCUS.into()
     } else {
-        format!("Additional reviewer focus:\n{}", focus.trim())
+        format!(
+            "{BASE_REVIEW_FOCUS}\n\nAdditional reviewer focus:\n{}",
+            focus.trim()
+        )
     };
     format!(
         r#"Review GitHub pull request {url}: {title}
@@ -1403,6 +1407,7 @@ mod tests {
         );
         assert!(prompt.contains(".kritikon/review.md"));
         assert!(prompt.contains("Focus on race conditions."));
+        assert!(prompt.contains("Prioritize correctness, regressions, security"));
         assert!(prompt.contains("Do not edit product files"));
         assert!(prompt.contains("Do not") && prompt.contains("gh pr review"));
         assert!(prompt.contains("APPROVE"));
@@ -1420,6 +1425,7 @@ mod tests {
         assert!(prompt.contains(".kritikon/previous-review.md"));
         assert!(prompt.contains("existing proposed review"));
         assert!(prompt.contains("Preserve still-valid findings"));
+        assert!(prompt.contains("Prioritize correctness, regressions, security"));
         assert!(prompt.contains("Verify whether the cancellation finding is still valid."));
         assert!(prompt.contains("complete revised review"));
         assert!(prompt.contains(".kritikon/review.md"));
