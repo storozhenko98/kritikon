@@ -192,6 +192,12 @@ fn run_tui(
                         app.set_notice(format!("Could not copy branch: {error:#}"));
                     }
                 },
+                Action::CopyUrl(url) => match clipboard::copy(&url) {
+                    Ok(()) => app.set_notice("Copied selected PR URL"),
+                    Err(error) => {
+                        app.set_notice(format!("Could not copy PR URL: {error:#}"));
+                    }
+                },
                 Action::SaveConfig(config) => match store.save(&config) {
                     Ok(()) => app.apply_config(config, false),
                     Err(error) => app.config_write_failed(format!("Could not save: {error:#}")),

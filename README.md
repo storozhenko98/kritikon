@@ -33,7 +33,7 @@ The installer selects the native binary, verifies its SHA-256 checksum, and plac
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://storozhenko98.github.io/kritikon/install.sh -o install-kritikon.sh
-KRITIKON_INSTALL_DIR="$HOME/bin" KRITIKON_VERSION=0.3.2 sh install-kritikon.sh
+KRITIKON_INSTALL_DIR="$HOME/bin" KRITIKON_VERSION=0.3.3 sh install-kritikon.sh
 rm install-kritikon.sh
 ```
 
@@ -68,6 +68,7 @@ An unavailable or slow network never blocks the dashboard for more than three se
 | Switch view | `Tab`, `Shift+Tab`, `←`, `→` | Click a tab |
 | Open selected PR | `Enter` or `o` | Single-click a PR row |
 | Copy selected PR's head branch | `c` | — |
+| Copy selected PR's URL | `Shift+C` | — |
 | Expand/collapse details | `d` or `Esc`; arrows/PgUp/PgDn scroll | Wheel/trackpad |
 | Configure refresh timer | `t` | Click editor controls |
 | Refresh now | `r` | — |

@@ -742,11 +742,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let keys = if app.details_expanded {
-        "↑↓/jk/PgUp/PgDn scroll details  Home/End jump  Enter open  c copy branch  d/Esc return  t timer  ? help  q quit"
+        "↑↓/jk/PgUp/PgDn scroll details  Home/End jump  Enter open  c branch  Shift+C URL  d/Esc return  t timer  ? help  q quit"
     } else if area.width >= 100 {
-        "↑↓/jk move  PgUp/PgDn  Tab/←→ views  Enter/o open  c copy branch  d details  t timer  r refresh  ? help  q quit"
+        "↑↓/jk move  PgUp/PgDn  Tab/←→ views  Enter/o open  c branch  Shift+C URL  d details  t timer  r refresh  ? help  q quit"
     } else {
-        "↑↓ move  Tab/←→ views  Enter open  c copy  d details  t timer  r refresh  ? help  q quit"
+        "↑↓ move  Tab/←→ views  Enter open  c/C copy  d details  t timer  r refresh  ? help  q quit"
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -801,7 +801,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )),
         Line::raw("  ↑/↓ or j/k  move     PgUp/PgDn  page     Home/End  jump"),
         Line::raw("  Tab/Shift+Tab or ←/→  switch views     Enter/o  open in browser"),
-        Line::raw("  c  copy head branch     d  expand details     t  refresh timer"),
+        Line::raw("  c  copy head branch     Shift+C  copy PR URL"),
+        Line::raw("  d  expand details       t  refresh timer"),
         Line::raw("  r  refresh     q  quit"),
         Line::raw("  Mouse wheel scrolls; a single left-click on a PR opens it."),
         Line::raw(""),
@@ -1213,6 +1214,7 @@ mod tests {
         assert!(rendered.contains("CHANGES REQUESTED"));
         assert!(rendered.contains("review-dashboard"));
         assert!(rendered.contains("Reviewer breakdown"));
+        assert!(rendered.contains("Shift+C URL"));
     }
 
     #[test]
@@ -1343,5 +1345,6 @@ mod tests {
         assert!(rendered.contains("acme/core"));
         assert!(rendered.contains("acme/platform"));
         assert!(rendered.contains("refreshes incrementally"));
+        assert!(rendered.contains("Shift+C  copy PR URL"));
     }
 }
