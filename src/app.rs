@@ -289,7 +289,7 @@ impl App {
                         .retain(|warning| !self.commit_warnings.contains(warning));
                 }
                 self.committed_pull_requests = commit_involvement.pull_requests;
-                self.commit_warnings.clear();
+                self.commit_warnings = commit_involvement.warnings;
                 if let Some(data) = &mut self.data {
                     merge_commit_involvement(
                         data,

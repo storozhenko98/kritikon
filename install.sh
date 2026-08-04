@@ -67,13 +67,13 @@ printf 'Downloading Kritikon for %s/%s…\n' "$os" "$arch"
 fetch "$release_url/$archive" "$temp_dir/$archive"
 fetch "$release_url/SHA256SUMS" "$temp_dir/SHA256SUMS"
 
-expected="$(awk -v file="$archive" '$2 == file || $2 == "*" file { print $1; exit }' "$temp_dir/SHA256SUMS")"
+expected="$(LC_ALL=C awk -v file="$archive" '$2 == file || $2 == "*" file { print $1; exit }' "$temp_dir/SHA256SUMS")"
 [ -n "$expected" ] || fail "release checksum is missing for $archive"
 
 if has sha256sum; then
-    actual="$(sha256sum "$temp_dir/$archive" | awk '{print $1}')"
+    actual="$(LC_ALL=C sha256sum "$temp_dir/$archive" | LC_ALL=C awk '{print $1}')"
 elif has shasum; then
-    actual="$(shasum -a 256 "$temp_dir/$archive" | awk '{print $1}')"
+    actual="$(LC_ALL=C shasum -a 256 "$temp_dir/$archive" | LC_ALL=C awk '{print $1}')"
 else
     fail "sha256sum or shasum is required to verify the download"
 fi

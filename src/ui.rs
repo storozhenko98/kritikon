@@ -86,7 +86,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(MUTED),
             ),
             if app.commit_loading {
-                Span::styled("  ·  indexing commits…", Style::default().fg(Color::Yellow))
+                Span::styled(
+                    "  ·  syncing commit PRs…",
+                    Style::default().fg(Color::Yellow),
+                )
             } else {
                 Span::raw("")
             },
@@ -721,7 +724,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled("Refreshing…", Style::default().fg(Color::Yellow))
     } else if app.commit_loading && app.data.is_some() {
         Span::styled(
-            "Discovering open PRs connected to your commits…",
+            "Syncing open PRs connected to your commits…",
             Style::default().fg(Color::Yellow),
         )
     } else if let Some(error) = &app.error {
@@ -812,9 +815,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Line::raw("  MY PRS     every open PR you authored, including drafts and no-review PRs"),
         review_sources_line(app),
-        Line::raw(
-            "  Commit-only discovery indexes your 1,000 newest searchable commits in the background.",
-        ),
+        Line::raw("  Commit discovery indexes 1,000 commits, then refreshes incrementally."),
         Line::raw(""),
         Line::from(Span::styled(
             "Every review state",
@@ -1341,5 +1342,6 @@ mod tests {
         assert!(rendered.contains("@viewer directly"));
         assert!(rendered.contains("acme/core"));
         assert!(rendered.contains("acme/platform"));
+        assert!(rendered.contains("refreshes incrementally"));
     }
 }
