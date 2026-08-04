@@ -108,9 +108,10 @@ Every review panel and background job is keyed to the exact PR URL. Dashboard ro
 
 The draft view supports:
 
-- `f` — follow up on the rendered review in the same OpenCode session. Enter the question or concern to revisit; Kritikon keeps the current draft visible and replaces it only after OpenCode produces a new non-empty review. `e` remains an alias for this flow.
+- `f` — follow up on the rendered review in the same OpenCode session. Enter the question or concern to revisit; Kritikon keeps the current draft visible and replaces it only after OpenCode produces a new non-empty review.
+- `e` — start a clean review with optional custom focus while retaining the current OpenCode session context. The existing draft is intentionally replaced by the new run.
 - `r` — re-review from scratch in the same OpenCode session. This intentionally clears the current draft but retains the conversation context.
-- `n` — start a completely new session and clean review. Because this forgets both Kritikon's current session link and saved draft, it requires a separate confirmation.
+- `n` — start a completely new session and clean review. After confirming, Kritikon opens an optional-focus editor; the current session link and draft remain intact until the final `Enter` launches the replacement session.
 - `o` — attach the full OpenCode TUI to a running review, or reopen the saved chat after completion, without automatically sending another review prompt.
 - `p` — choose **Approve**, **Comment**, or **Request changes**, then pass a separate confirmation screen before Kritikon invokes `gh pr review`.
 

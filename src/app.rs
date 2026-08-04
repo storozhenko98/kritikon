@@ -1138,14 +1138,22 @@ impl App {
                         focus: None,
                     }
                 }
-                KeyCode::Char('f') | KeyCode::Char('e') => {
+                KeyCode::Char('f')
+                    if self.review_panel.as_ref().is_some_and(|panel| {
+                        panel.snapshot.has_draft() && panel.snapshot.has_session()
+                    }) =>
+                {
                     let panel = self.review_panel.as_mut().expect("review panel exists");
                     panel.mode = ReviewPanelMode::Prompt;
-                    panel.run_kind = if panel.snapshot.has_draft() && panel.snapshot.has_session() {
-                        ReviewRunKind::FollowUp
-                    } else {
-                        ReviewRunKind::ReReview
-                    };
+                    panel.run_kind = ReviewRunKind::FollowUp;
+                    panel.input.clear();
+                    panel.error = None;
+                    Action::None
+                }
+                KeyCode::Char('e') => {
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.mode = ReviewPanelMode::Prompt;
+                    panel.run_kind = ReviewRunKind::ReReview;
                     panel.input.clear();
                     panel.error = None;
                     Action::None
@@ -1213,12 +1221,12 @@ impl App {
             },
             ReviewPanelMode::ConfirmNewSession => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    let panel = self.review_panel.as_ref().expect("review panel exists");
-                    Action::LaunchReview {
-                        target: panel.snapshot.target.clone(),
-                        mode: LaunchMode::Review(ReviewRunKind::NewSession),
-                        focus: None,
-                    }
+                    let panel = self.review_panel.as_mut().expect("review panel exists");
+                    panel.mode = ReviewPanelMode::Prompt;
+                    panel.run_kind = ReviewRunKind::NewSession;
+                    panel.input.clear();
+                    panel.error = None;
+                    Action::None
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
                     self.review_panel
@@ -1924,7 +1932,18 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
         assert_eq!(
             app.review_panel.as_ref().unwrap().run_kind,
-            ReviewRunKind::FollowUp
+            ReviewRunKind::ReReview
+        );
+        for character in "focus on auth boundaries".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::ReReview),
+                focus: Some("focus on auth boundaries".into()),
+            }
         );
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
 
@@ -1948,6 +1967,27 @@ mod tests {
             ReviewPanelMode::Draft
         );
         assert_eq!(app.handle_key(key(KeyCode::Char('n'))), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.mode, ReviewPanelMode::Prompt);
+        assert_eq!(panel.run_kind, ReviewRunKind::NewSession);
+        assert_eq!(panel.snapshot.draft, snapshot.draft);
+        assert_eq!(panel.snapshot.session_id, snapshot.session_id);
+        for character in "focus on authorization".chars() {
+            assert_eq!(app.handle_key(key(KeyCode::Char(character))), Action::None);
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::LaunchReview {
+                target: snapshot.target.clone(),
+                mode: LaunchMode::Review(ReviewRunKind::NewSession),
+                focus: Some("focus on authorization".into()),
+            }
+        );
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Action::None);
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Action::LaunchReview {

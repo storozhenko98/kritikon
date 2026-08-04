@@ -997,8 +997,8 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 ])
                 .split(inner);
             frame.render_widget(Paragraph::new(header), chunks[0]);
-            let prompt_lines = if run_kind == crate::review_agent::ReviewRunKind::FollowUp {
-                vec![
+            let prompt_lines = match run_kind {
+                crate::review_agent::ReviewRunKind::FollowUp => vec![
                     Line::from(Span::styled(
                         "Follow up on the saved review",
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1020,11 +1020,14 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                             MUTED
                         }),
                     )),
-                ]
-            } else {
-                vec![
+                ],
+                crate::review_agent::ReviewRunKind::ReReview => vec![
                     Line::from(Span::styled(
-                        "Default review template · fresh draft in the current session",
+                        if snapshot.has_session() {
+                            "New review · keep the current session"
+                        } else {
+                            "Default review template · new OpenCode session"
+                        },
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     )),
                     Line::raw(
@@ -1041,21 +1044,46 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         "Optional focus — type below, or leave blank for the complete template",
                         Style::default().fg(MUTED),
                     )),
-                ]
+                ],
+                crate::review_agent::ReviewRunKind::NewSession => vec![
+                    Line::from(Span::styled(
+                        "New OpenCode session · clean review",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(
+                        "The current session link and saved draft remain untouched while you write these instructions.",
+                    ),
+                    Line::raw(
+                        "They are cleared only when you press Enter below to launch the new session.",
+                    ),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        "Optional focus — type below, or leave blank for the complete template",
+                        Style::default().fg(MUTED),
+                    )),
+                ],
             };
             frame.render_widget(
                 Paragraph::new(prompt_lines).wrap(Wrap { trim: true }),
                 chunks[1],
             );
-            let (editor_title, placeholder) =
-                if run_kind == crate::review_agent::ReviewRunKind::FollowUp {
+            let (editor_title, placeholder) = match run_kind {
+                crate::review_agent::ReviewRunKind::FollowUp => {
                     ("Follow-up instructions", "Describe what to revisit…")
-                } else {
-                    (
-                        "Focus instructions",
-                        "Add optional guidance for this review…",
-                    )
-                };
+                }
+                crate::review_agent::ReviewRunKind::ReReview => (
+                    if snapshot.has_session() {
+                        "New review focus"
+                    } else {
+                        "Focus instructions"
+                    },
+                    "Add optional guidance for this review…",
+                ),
+                crate::review_agent::ReviewRunKind::NewSession => (
+                    "New-session focus",
+                    "Add optional guidance for the new session…",
+                ),
+            };
             render_review_focus_editor(frame, chunks[2], &input, editor_title, placeholder);
         }
         ReviewPanelMode::Running(phase) => {
@@ -1173,12 +1201,12 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             frame.render_widget(paragraph.scroll((scroll.min(max_scroll), 0)), chunks[1]);
             let controls = if has_draft && snapshot.has_session() && chunks[2].width < 96 {
                 vec![
-                    Line::raw("f follow up  ·  r re-review  ·  n new session"),
-                    Line::raw("o chat  ·  p post  ·  Esc close  ·  ↑↓/jk scroll"),
+                    Line::raw("f follow up  ·  e new review  ·  r re-review"),
+                    Line::raw("n new session  ·  o chat  ·  p post  ·  Esc close  ·  ↑↓ scroll"),
                 ]
             } else if has_draft && snapshot.has_session() {
                 vec![Line::raw(
-                    "↑↓/jk scroll  ·  f follow up  ·  r re-review  ·  n new session  ·  o chat  ·  p post  ·  Esc close",
+                    "↑↓/jk scroll  ·  f follow up  ·  e new review  ·  r re-review  ·  n new session  ·  o chat  ·  p post  ·  Esc close",
                 )]
             } else if has_draft {
                 vec![Line::raw(
@@ -1213,7 +1241,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         ),
                         Line::raw(""),
                         Line::from(Span::styled(
-                            "y / Enter  start new session  ·  n / Esc  keep current session and draft",
+                            "y / Enter  continue to optional focus  ·  n / Esc  keep current session and draft",
                             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                         )),
                     ],
@@ -2086,6 +2114,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("f follow up"));
+        assert!(rendered.contains("e new review"));
         assert!(rendered.contains("r re-review"));
         assert!(rendered.contains("n new session"));
         assert!(rendered.contains("o chat"));
@@ -2194,6 +2223,26 @@ mod tests {
         assert!(confirmation.contains("completely new OpenCode session"));
         assert!(confirmation.contains("clears the saved draft"));
         assert!(confirmation.contains("keep current session and draft"));
+        assert!(confirmation.contains("continue to optional focus"));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let new_session_prompt = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(new_session_prompt.contains("New OpenCode session"));
+        assert!(new_session_prompt.contains("remain untouched while you write"));
+        assert!(new_session_prompt.contains("New-session focus"));
+        assert!(new_session_prompt.contains("Add optional guidance for the new session"));
     }
 
     #[test]
