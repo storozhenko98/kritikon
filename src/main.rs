@@ -5,6 +5,7 @@ mod config;
 mod dev;
 mod github;
 mod model;
+mod review_agent;
 mod ui;
 mod updater;
 
@@ -198,6 +199,61 @@ fn run_tui(
                         app.set_notice(format!("Could not copy PR URL: {error:#}"));
                     }
                 },
+                Action::OpenReview(target) => {
+                    #[cfg(debug_assertions)]
+                    let result = if source != DataSource::Github {
+                        Ok(review_agent::development_snapshot(target.clone()))
+                    } else {
+                        review_agent::inspect(target.clone()).map_err(|error| format!("{error:#}"))
+                    };
+                    #[cfg(not(debug_assertions))]
+                    let result =
+                        review_agent::inspect(target.clone()).map_err(|error| format!("{error:#}"));
+
+                    match result {
+                        Ok(snapshot) => app.show_review_snapshot(snapshot),
+                        Err(error) => app.show_review_error(target, error),
+                    }
+                }
+                Action::LaunchReview {
+                    target,
+                    mode,
+                    focus,
+                } => {
+                    #[cfg(debug_assertions)]
+                    if source != DataSource::Github {
+                        let mut snapshot = review_agent::development_snapshot(target);
+                        if let Some(focus) = focus {
+                            snapshot.warning = Some(format!(
+                                "DEV simulation used custom focus: {}",
+                                focus.trim()
+                            ));
+                        }
+                        app.show_review_snapshot(snapshot);
+                        continue;
+                    }
+
+                    suspend_terminal(&mut terminal)?;
+                    let result = review_agent::launch(target.clone(), mode, focus.as_deref())
+                        .map_err(|error| format!("{error:#}"));
+                    resume_terminal(&mut terminal)?;
+                    match result {
+                        Ok(snapshot) => app.show_review_snapshot(snapshot),
+                        Err(error) => app.show_review_error(target, error),
+                    }
+                }
+                Action::PostReview(snapshot, kind) => {
+                    #[cfg(debug_assertions)]
+                    if source != DataSource::Github {
+                        app.review_posted(kind);
+                        continue;
+                    }
+
+                    match review_agent::post_review(&snapshot, kind) {
+                        Ok(()) => app.review_posted(kind),
+                        Err(error) => app.review_failed(format!("{error:#}")),
+                    }
+                }
                 Action::SaveConfig(config) => match store.save(&config) {
                     Ok(()) => app.apply_config(config, false),
                     Err(error) => app.config_write_failed(format!("Could not save: {error:#}")),
@@ -228,6 +284,35 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
             Err(error).context("could not create terminal backend")
         }
     }
+}
+
+fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    terminal
+        .show_cursor()
+        .context("could not show terminal cursor")?;
+    disable_raw_mode().context("could not suspend terminal raw mode")?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .context("could not suspend Kritikon terminal screen")
+}
+
+fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    enable_raw_mode().context("could not restore terminal raw mode")?;
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error).context("could not restore Kritikon terminal screen");
+    }
+    terminal.clear().context("could not redraw Kritikon")?;
+    terminal
+        .hide_cursor()
+        .context("could not hide terminal cursor")
 }
 
 struct TerminalGuard;

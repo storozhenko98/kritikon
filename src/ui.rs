@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, ConfigFocus, RowHitbox, Tab},
+    app::{App, ConfigFocus, ReviewPanelMode, RowHitbox, Tab},
     config::MIN_REFRESH_SECONDS,
     model::{
         CheckState, DisplayReviewState, MergeableState, PullRequest, ReviewState, ReviewerKind,
@@ -41,6 +41,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.config_editor.is_some() {
         render_config(frame, area, app);
+    }
+    if app.review_panel.is_some() {
+        render_review_panel(frame, area, app);
     }
 }
 
@@ -742,11 +745,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let keys = if app.details_expanded {
-        "↑↓/jk/PgUp/PgDn scroll details  Home/End jump  Enter open  c branch  Shift+C URL  d/Esc return  t timer  ? help  q quit"
+        "↑↓/jk/PgUp/PgDn scroll details  Home/End jump  Enter open  c branch  Shift+C URL  Shift+R agent  d/Esc return  ? help  q quit"
     } else if area.width >= 100 {
-        "↑↓/jk move  PgUp/PgDn  Tab/←→ views  Enter/o open  c branch  Shift+C URL  d details  t timer  r refresh  ? help  q quit"
+        "↑↓/jk move  Tab/←→ views  Enter/o open  c branch  Shift+C URL  Shift+R agent  d details  t timer  r refresh  ? help  q quit"
     } else {
-        "↑↓ move  Tab/←→ views  Enter open  c/C copy  d details  t timer  r refresh  ? help  q quit"
+        "↑↓ move  Tab views  Enter open  c/C copy  Shift+R agent  d details  t timer  r refresh  q quit"
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -801,9 +804,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )),
         Line::raw("  ↑/↓ or j/k  move     PgUp/PgDn  page     Home/End  jump"),
         Line::raw("  Tab/Shift+Tab or ←/→  switch views     Enter/o  open in browser"),
-        Line::raw("  c  copy head branch     Shift+C  copy PR URL"),
-        Line::raw("  d  expand details       t  refresh timer"),
-        Line::raw("  r  refresh     q  quit"),
+        Line::raw("  c  copy branch     Shift+C  copy URL     Shift+R  OpenCode review"),
+        Line::raw("  d  expand details   t  refresh timer    r  refresh    q  quit"),
         Line::raw("  Mouse wheel scrolls; a single left-click on a PR opens it."),
         Line::raw(""),
         Line::from(Span::styled(
@@ -891,6 +893,304 @@ fn review_sources_line(app: &App) -> Line<'static> {
         Span::styled("  Monitoring: ", Style::default().fg(MUTED)),
         Span::raw(sources),
     ])
+}
+
+fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(panel) = app.review_panel.as_ref() else {
+        return;
+    };
+    let mode = panel.mode;
+    let snapshot = panel.snapshot.clone();
+    let input = panel.input.clone();
+    let error = panel.error.clone();
+    let scroll = panel.scroll;
+
+    let width = 110.min(area.width.saturating_sub(2));
+    let height = 34.min(area.height.saturating_sub(2));
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" OpenCode PR review ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(popup).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    frame.render_widget(block, popup);
+
+    let header = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}#{}", snapshot.target.repository, snapshot.target.number),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if snapshot.has_session() {
+                    "  ·  resumable session"
+                } else {
+                    "  ·  new session"
+                },
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::from(Span::styled(
+            snapshot.target.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    match mode {
+        ReviewPanelMode::Prompt => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(8),
+                    Constraint::Length(5),
+                ])
+                .split(inner);
+            frame.render_widget(Paragraph::new(header), chunks[0]);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Default review template",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::raw(
+                        "Review the actual diff for correctness, regressions, security, data loss, concurrency, and missing tests.",
+                    ),
+                    Line::raw(
+                        "OpenCode runs with permission auto-approval in a managed scratch checkout. It is instructed not to edit product files or post to GitHub.",
+                    ),
+                    Line::raw(
+                        "It must save the proposed review to .kritikon/review.md. Kritikon preserves the session for later chat and re-review.",
+                    ),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        "Optional focus — type below, or leave blank for the template",
+                        Style::default().fg(MUTED),
+                    )),
+                ])
+                .wrap(Wrap { trim: true }),
+                chunks[1],
+            );
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(vec![
+                        Span::styled("> ", Style::default().fg(ACCENT)),
+                        Span::raw(if input.is_empty() {
+                            "".into()
+                        } else {
+                            input
+                        }),
+                        Span::styled("█", Style::default().fg(ACCENT)),
+                    ]),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        "Enter start review in OpenCode  ·  Backspace edit  ·  Delete clear  ·  Esc cancel",
+                        Style::default().fg(MUTED),
+                    )),
+                ])
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                ),
+                chunks[2],
+            );
+        }
+        ReviewPanelMode::Draft => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(5),
+                    Constraint::Length(2),
+                ])
+                .split(inner);
+            frame.render_widget(Paragraph::new(header), chunks[0]);
+            let mut lines = snapshot
+                .draft
+                .as_deref()
+                .map(markdown_lines)
+                .unwrap_or_else(|| {
+                    vec![Line::from(Span::styled(
+                        "No saved draft yet. Press r to run the review template or e to add custom focus.",
+                        Style::default().fg(Color::Yellow),
+                    ))]
+                });
+            if let Some(warning) = snapshot.warning {
+                lines.insert(
+                    0,
+                    Line::from(Span::styled(
+                        format!("Warning: {warning}"),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                );
+                lines.insert(1, Line::raw(""));
+            }
+            let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+            let line_count = paragraph.line_count(chunks[1].width) as u16;
+            let max_scroll = line_count.saturating_sub(chunks[1].height);
+            if let Some(panel) = &mut app.review_panel {
+                panel.max_scroll = max_scroll;
+                panel.scroll = panel.scroll.min(max_scroll);
+            }
+            frame.render_widget(paragraph.scroll((scroll.min(max_scroll), 0)), chunks[1]);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "↑↓/jk scroll  ·  r re-review  ·  e custom focus  ·  o OpenCode chat  ·  p post  ·  Esc close",
+                    Style::default().fg(MUTED),
+                ))),
+                chunks[2],
+            );
+        }
+        ReviewPanelMode::PostChoice => {
+            frame.render_widget(
+                Paragraph::new(
+                    [
+                        header,
+                        vec![
+                            Line::raw(""),
+                            Line::from(Span::styled(
+                                "Choose the GitHub review action",
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            )),
+                            Line::raw(""),
+                            Line::raw("  a  Approve"),
+                            Line::raw("  c  Comment without approval or change request"),
+                            Line::raw("  x  Request changes"),
+                            Line::raw(""),
+                            Line::from(Span::styled(
+                                "Nothing is posted until the separate confirmation screen.",
+                                Style::default().fg(Color::Yellow),
+                            )),
+                            Line::raw(""),
+                            Line::from(Span::styled(
+                                "Esc  back to draft",
+                                Style::default().fg(MUTED),
+                            )),
+                        ],
+                    ]
+                    .concat(),
+                )
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+        ReviewPanelMode::ConfirmPost(kind) => {
+            frame.render_widget(
+                Paragraph::new([
+                    header,
+                    vec![
+                        Line::raw(""),
+                        Line::from(vec![
+                            Span::raw("Post this draft as "),
+                            Span::styled(
+                                kind.label(),
+                                Style::default()
+                                    .fg(match kind {
+                                        crate::review_agent::ReviewKind::Approve => Color::Green,
+                                        crate::review_agent::ReviewKind::Comment => Color::Blue,
+                                        crate::review_agent::ReviewKind::RequestChanges => Color::Red,
+                                    })
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("?"),
+                        ]),
+                        Line::raw(""),
+                        Line::from(snapshot.target.url.clone()),
+                        Line::from(Span::styled(
+                            format!("Draft: {}", snapshot.draft_path.display()),
+                            Style::default().fg(MUTED),
+                        )),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "This performs a real GitHub review action as your authenticated gh account.",
+                            Style::default().fg(Color::Yellow),
+                        )),
+                        Line::raw(""),
+                        Line::from(vec![
+                            Span::styled(
+                                "y / Enter  post now",
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("    "),
+                            Span::styled("n / Esc  cancel", Style::default().fg(MUTED)),
+                        ]),
+                    ],
+                ]
+                .concat())
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+        ReviewPanelMode::Error => {
+            frame.render_widget(
+                Paragraph::new([
+                    header,
+                    vec![
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Review agent could not continue",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::raw(""),
+                        Line::from(error.unwrap_or_else(|| "Unknown review-agent error".into())),
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            "Check `gh auth status` and `opencode --version`. Press r to reload the saved session or Esc to close.",
+                            Style::default().fg(MUTED),
+                        )),
+                    ],
+                ]
+                .concat())
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+    }
+}
+
+fn markdown_lines(source: &str) -> Vec<Line<'static>> {
+    let mut in_code_block = false;
+    source
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                in_code_block = !in_code_block;
+                return Line::from(Span::styled(line.to_string(), Style::default().fg(MUTED)));
+            }
+            if in_code_block {
+                return Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            if trimmed.starts_with('#') {
+                return Line::from(Span::styled(
+                    trimmed.trim_start_matches('#').trim().to_string(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+            }
+            let color = if trimmed.contains("BLOCKING") {
+                Color::Red
+            } else if trimmed.contains("IMPORTANT") {
+                Color::Yellow
+            } else if trimmed.contains("SUGGESTION") {
+                Color::Blue
+            } else {
+                Color::Reset
+            };
+            Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
+        })
+        .collect()
 }
 
 fn render_config(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -1132,6 +1432,8 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use chrono::Utc;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -1141,6 +1443,7 @@ mod tests {
             DashboardData, InvolvementReason, MergeableState, PullRequest, Review, ReviewDecision,
             ReviewRequest, ReviewState, ReviewerKind,
         },
+        review_agent::{ReviewSnapshot, ReviewTarget},
     };
 
     use super::*;
@@ -1178,6 +1481,20 @@ mod tests {
             checks: Some(CheckState::Failure),
             requested_via: vec!["@viewer".into()],
             involvement: vec![InvolvementReason::Committed, InvolvementReason::Commented],
+        }
+    }
+
+    fn review_snapshot(session: bool, draft: bool) -> ReviewSnapshot {
+        ReviewSnapshot {
+            target: ReviewTarget::from(&sample_pr()),
+            session_id: session.then(|| "ses_review".into()),
+            draft: draft.then(|| {
+                "# Summary\n\nA careful review.\n\n# Findings\n\n- **BLOCKING** `src/main.rs:42` — Example issue.\n\n# Recommended decision\n\nREQUEST_CHANGES\n"
+                    .into()
+            }),
+            draft_path: PathBuf::from("/tmp/kritikon/review.md"),
+            workspace: PathBuf::from("/tmp/kritikon/workspace"),
+            warning: None,
         }
     }
 
@@ -1345,6 +1662,92 @@ mod tests {
         assert!(rendered.contains("acme/core"));
         assert!(rendered.contains("acme/platform"));
         assert!(rendered.contains("refreshes incrementally"));
-        assert!(rendered.contains("Shift+C  copy PR URL"));
+        assert!(rendered.contains("Shift+C  copy URL"));
+        assert!(rendered.contains("Shift+R  OpenCode review"));
+    }
+
+    #[test]
+    fn review_prompt_explains_the_template_permissions_and_saved_session() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(false, false));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("OpenCode PR review"));
+        assert!(rendered.contains("Default review template"));
+        assert!(rendered.contains("permission auto-approval"));
+        assert!(rendered.contains("Optional focus"));
+        assert!(rendered.contains("Enter start review in OpenCode"));
+    }
+
+    #[test]
+    fn saved_review_renders_markdown_and_explicit_post_confirmation() {
+        let mut app = App::with_data(DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        });
+        app.show_review_snapshot(review_snapshot(true, true));
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("A careful review."));
+        assert!(rendered.contains("BLOCKING"));
+        assert!(rendered.contains("o OpenCode chat"));
+        assert!(rendered.contains("p post"));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Post this draft as REQUEST CHANGES?"));
+        assert!(rendered.contains("performs a real GitHub review action"));
+        assert!(rendered.contains("y / Enter  post now"));
     }
 }

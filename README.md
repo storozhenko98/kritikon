@@ -69,11 +69,54 @@ An unavailable or slow network never blocks the dashboard for more than three se
 | Open selected PR | `Enter` or `o` | Single-click a PR row |
 | Copy selected PR's head branch | `c` | — |
 | Copy selected PR's URL | `Shift+C` | — |
+| Open resumable OpenCode review agent | `Shift+R` | — |
 | Expand/collapse details | `d` or `Esc`; arrows/PgUp/PgDn scroll | Wheel/trackpad |
 | Configure refresh timer | `t` | Click editor controls |
 | Refresh now | `r` | — |
 | Full state legend | `?` | — |
 | Quit | `q` or `Ctrl+C` | — |
+
+## Optional OpenCode review agent
+
+`Shift+R` turns the selected PR into a resumable agent-review workspace. This feature is optional: the normal dashboard has no OpenCode dependency.
+
+Requirements:
+
+- `opencode` must be installed, authenticated, and available on `PATH`.
+- `gh` must be authenticated to the host containing the selected PR.
+- macOS and Linux are supported. Windows is not supported.
+
+Kritikon normally uses your OpenCode default model. Set `KRITIKON_OPENCODE_MODEL` when you want a dedicated reviewer model, for example:
+
+```bash
+KRITIKON_OPENCODE_MODEL=opencode/gpt-5.4 kritikon
+```
+
+On a PR with no saved agent session:
+
+1. Press `Shift+R`.
+2. Leave the focus field blank to use Kritikon's thorough review template, or type additional instructions such as `focus on cancellation and data-loss paths`.
+3. Press `Enter`. Kritikon temporarily leaves its own screen, prepares a managed scratch checkout, and opens the real OpenCode TUI with permission auto-approval enabled.
+4. OpenCode reviews the checked-out PR and is instructed to write the proposed review body to `.kritikon/review.md` without posting anything.
+5. Chat or ask follow-up questions directly in OpenCode. When you exit OpenCode, Kritikon returns and renders the saved Markdown draft.
+
+The draft view supports:
+
+- `r` — run the standard review prompt again in the same OpenCode session.
+- `e` — add custom focus and continue the same session.
+- `o` — reopen the full OpenCode chat without automatically sending another review prompt.
+- `p` — choose **Approve**, **Comment**, or **Request changes**, then pass a separate confirmation screen before Kritikon invokes `gh pr review`.
+
+OpenCode context is preserved by session ID per PR. Reopening the same PR—even after a later review request—continues the prior conversation. Before each launch, Kritikon refreshes its disposable checkout to the latest PR head and restores the last saved draft.
+
+Session records and drafts use native data directories:
+
+- macOS: `~/Library/Application Support/kritikon/review-sessions/`
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/kritikon/review-sessions/`
+
+Repository checkouts live under the operating system's temporary directory in `kritikon/review-workspaces/`. They are managed scratch copies; OpenCode does not run inside your working repository.
+
+> **Permission warning:** OpenCode runs with permission auto-approval, as requested, inside the scratch checkout. This skips interactive tool approvals but is not an operating-system sandbox; OpenCode still inherits your user account, network access, and configured credentials. Kritikon's template forbids product edits and direct GitHub posting, and Kritikon itself never posts the draft without the explicit two-step confirmation.
 
 ## Configuration
 
