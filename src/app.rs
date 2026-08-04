@@ -135,6 +135,7 @@ pub enum ReviewAgentState {
     Reviewing,
     Ready,
     Draft,
+    Session,
     Failed,
 }
 
@@ -322,6 +323,7 @@ impl App {
 
     pub fn review_completed(&mut self, snapshot: ReviewSnapshot) {
         let target_url = snapshot.target.url.clone();
+        let has_draft = snapshot.has_draft();
         self.active_reviews.remove(&target_url);
         if self.review_panel.as_ref().is_some_and(|panel| {
             panel.snapshot.target.url == target_url
@@ -333,14 +335,22 @@ impl App {
                 target_url.clone(),
                 Self::panel_for_snapshot(snapshot.clone(), ReviewPanelMode::Draft, None),
             );
-            self.ready_reviews.insert(
-                target_url,
-                format!("{}#{}", snapshot.target.repository, snapshot.target.number),
-            );
-            self.set_notice(format!(
-                "OpenCode review ready: {}#{} — Shift+R to inspect",
-                snapshot.target.repository, snapshot.target.number
-            ));
+            if has_draft {
+                self.ready_reviews.insert(
+                    target_url,
+                    format!("{}#{}", snapshot.target.repository, snapshot.target.number),
+                );
+                self.set_notice(format!(
+                    "OpenCode review ready: {}#{} — Shift+R to inspect",
+                    snapshot.target.repository, snapshot.target.number
+                ));
+            } else {
+                self.ready_reviews.remove(&target_url);
+                self.set_notice(format!(
+                    "OpenCode finished without a review draft: {}#{} — Shift+R to inspect or rerun",
+                    snapshot.target.repository, snapshot.target.number
+                ));
+            }
         }
     }
 
@@ -414,7 +424,15 @@ impl App {
             .and_then(|panel| match panel.mode {
                 ReviewPanelMode::Draft
                 | ReviewPanelMode::PostChoice
-                | ReviewPanelMode::ConfirmPost(_) => Some(ReviewAgentState::Draft),
+                | ReviewPanelMode::ConfirmPost(_) => {
+                    if panel.snapshot.has_draft() {
+                        Some(ReviewAgentState::Draft)
+                    } else if panel.snapshot.has_session() {
+                        Some(ReviewAgentState::Session)
+                    } else {
+                        None
+                    }
+                }
                 ReviewPanelMode::Error => Some(ReviewAgentState::Failed),
                 ReviewPanelMode::Running(ReviewRunPhase::Preparing) => {
                     Some(ReviewAgentState::Preparing)
@@ -1794,6 +1812,44 @@ mod tests {
         assert_eq!(
             app.review_panel.as_ref().unwrap().snapshot.draft,
             completed.draft
+        );
+    }
+
+    #[test]
+    fn completed_session_without_markdown_is_not_reported_as_a_ready_draft() {
+        let mut app = app();
+        let initial = review_snapshot(false, false);
+        let target_url = initial.target.url.clone();
+        app.review_started(initial);
+        app.close_review_panel();
+
+        app.review_completed(review_snapshot(true, false));
+
+        assert_eq!(app.active_review_count(), 0);
+        assert_eq!(
+            app.review_agent_state(&target_url),
+            Some(ReviewAgentState::Session)
+        );
+        assert!(app.ready_review_labels().is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(notice, _)| notice.contains("finished without a review draft"))
+        );
+
+        assert!(app.show_review_for_target(&target_url));
+        let panel = app.review_panel.as_ref().unwrap();
+        assert_eq!(panel.mode, ReviewPanelMode::Draft);
+        assert!(panel.snapshot.has_session());
+        assert!(!panel.snapshot.has_draft());
+        assert_eq!(
+            app.review_agent_state(&target_url),
+            Some(ReviewAgentState::Session)
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('p'))), Action::None);
+        assert_eq!(
+            app.review_panel.as_ref().unwrap().mode,
+            ReviewPanelMode::Draft
         );
     }
 

@@ -337,6 +337,7 @@ fn render_row(
             ReviewAgentState::Reviewing => (" AGENT RUNNING ", ACCENT),
             ReviewAgentState::Ready => (" AGENT READY ", Color::Green),
             ReviewAgentState::Draft => (" AGENT DRAFT ", Color::Blue),
+            ReviewAgentState::Session => (" AGENT SESSION ", Color::DarkGray),
             ReviewAgentState::Failed => (" AGENT FAILED ", Color::Red),
         };
         title.push(Span::raw(" "));
@@ -1070,6 +1071,7 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             );
         }
         ReviewPanelMode::Draft => {
+            let has_draft = snapshot.has_draft();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -1107,9 +1109,14 @@ fn render_review_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 panel.scroll = panel.scroll.min(max_scroll);
             }
             frame.render_widget(paragraph.scroll((scroll.min(max_scroll), 0)), chunks[1]);
+            let controls = if has_draft {
+                "↑↓/jk scroll  ·  r re-review  ·  e custom focus  ·  o optional OpenCode chat  ·  p post  ·  Esc close"
+            } else {
+                "↑↓/jk scroll  ·  r rerun  ·  e custom focus  ·  o resume OpenCode chat  ·  Esc close"
+            };
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "↑↓/jk scroll  ·  r re-review  ·  e custom focus  ·  o optional OpenCode chat  ·  p post  ·  Esc close",
+                    controls,
                     Style::default().fg(MUTED),
                 ))),
                 chunks[2],
@@ -2018,6 +2025,57 @@ mod tests {
             .unwrap();
         assert!(first_row.contains("AGENT PREP"));
         assert!(!second_row.contains("AGENT"));
+    }
+
+    #[test]
+    fn completed_session_without_markdown_has_session_badge_not_draft_badge() {
+        let data = DashboardData {
+            viewer: "viewer".into(),
+            review_queue: vec![sample_pr()],
+            involved: vec![],
+            owned: vec![],
+            warnings: vec![],
+            fetched_at: Utc::now(),
+            teams: vec![],
+        };
+        let mut app = App::with_data(data);
+        app.review_started(review_snapshot(false, false));
+        app.close_review_panel();
+        app.review_completed(review_snapshot(true, false));
+        app.notice = None;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("AGENT SESSION"));
+        assert!(!rendered.contains("AGENT DRAFT"));
+        assert!(!rendered.contains("AGENT READY"));
+        assert!(!rendered.contains("OpenCode review ready:"));
+
+        assert!(app.show_review_for_target("https://github.com/acme/app/pull/42"));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let panel = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(panel.contains("No saved draft yet"));
+        assert!(panel.contains("r rerun"));
+        assert!(panel.contains("o resume OpenCode chat"));
+        assert!(!panel.contains("p post"));
     }
 
     #[test]

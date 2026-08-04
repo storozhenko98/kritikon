@@ -195,7 +195,9 @@ impl ReviewCoordinator {
             bail!("an OpenCode review is already running for this pull request");
         }
 
-        let initial = self.store.inspect(target.clone())?;
+        let mut initial = self.store.inspect(target.clone())?;
+        self.store.clear_draft_outputs(&target)?;
+        initial.draft = None;
         let control = Arc::new(JobControl::default());
         self.active.insert(target.url.clone(), control.clone());
 
@@ -432,6 +434,12 @@ impl ReviewStore {
         atomic_write_private(destination, draft.as_bytes())?;
         Ok(Some(draft))
     }
+
+    fn clear_draft_outputs(&self, target: &ReviewTarget) -> Result<()> {
+        let paths = self.paths(target);
+        remove_optional_file(&paths.draft)?;
+        remove_optional_file(&workspace_draft_path(&paths.workspace))
+    }
 }
 
 struct ReviewPaths {
@@ -468,8 +476,6 @@ fn run_review_job(job: ReviewJob<'_>) -> Result<ReviewSnapshot> {
         bail!("review stopped before workspace preparation began");
     }
     prepare_workspace(&snapshot, &dependencies.gh)?;
-    restore_saved_draft(&snapshot)?;
-
     let capabilities = verify_opencode(&dependencies.opencode)?;
     let permission_config = opencode_permission_config()?;
     let paths = store.paths(&target);
@@ -527,6 +533,19 @@ fn run_review_job(job: ReviewJob<'_>) -> Result<ReviewSnapshot> {
             updated_at: now_epoch_seconds(),
         },
     )?;
+    let warning = if !status.success() {
+        Some(format!(
+            "The background OpenCode run exited with {status}; its session and any completed draft were preserved. Log: {}",
+            paths.log.display()
+        ))
+    } else if draft.is_none() {
+        Some(format!(
+            "OpenCode finished without saving .kritikon/review.md. The session is still available to inspect or rerun. Log: {}",
+            paths.log.display()
+        ))
+    } else {
+        None
+    };
 
     Ok(ReviewSnapshot {
         target,
@@ -534,12 +553,7 @@ fn run_review_job(job: ReviewJob<'_>) -> Result<ReviewSnapshot> {
         draft,
         draft_path: paths.draft,
         workspace: paths.workspace,
-        warning: (!status.success()).then(|| {
-            format!(
-                "The background OpenCode run exited with {status}; its session and any completed draft were preserved. Log: {}",
-                paths.log.display()
-            )
-        }),
+        warning,
     })
 }
 
@@ -741,14 +755,6 @@ fn prepare_workspace(snapshot: &ReviewSnapshot, gh: &Path) -> Result<()> {
         )
     })?;
     Ok(())
-}
-
-fn restore_saved_draft(snapshot: &ReviewSnapshot) -> Result<()> {
-    let Some(draft) = &snapshot.draft else {
-        return Ok(());
-    };
-    let path = workspace_draft_path(&snapshot.workspace);
-    atomic_write_private(&path, draft.as_bytes())
 }
 
 struct ServerProcess {
@@ -1139,6 +1145,14 @@ fn read_optional_nonempty(path: &Path) -> Result<Option<String>> {
     }
 }
 
+fn remove_optional_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("could not remove {}", path.display())),
+    }
+}
+
 fn now_epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1336,6 +1350,41 @@ mod tests {
             snapshot.workspace,
             workspaces.path().join("github-com-acme-widgets-pr-42")
         );
+    }
+
+    #[test]
+    fn fresh_review_clears_stale_saved_and_workspace_drafts_but_keeps_the_session() {
+        let data = tempdir().unwrap();
+        let workspaces = tempdir().unwrap();
+        let store = ReviewStore::at(data.path(), workspaces.path());
+        let target = target();
+        let paths = store.paths(&target);
+        atomic_write_private(&paths.draft, b"# Old saved review\n").unwrap();
+        atomic_write_private(
+            &workspace_draft_path(&paths.workspace),
+            b"# Old workspace review\n",
+        )
+        .unwrap();
+        store
+            .save_record(
+                &paths.record,
+                &ReviewRecord {
+                    version: RECORD_VERSION,
+                    target: target.clone(),
+                    session_id: "ses_existing".into(),
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+
+        store.clear_draft_outputs(&target).unwrap();
+        store.clear_draft_outputs(&target).unwrap();
+
+        let snapshot = store.inspect(target).unwrap();
+        assert_eq!(snapshot.session_id.as_deref(), Some("ses_existing"));
+        assert!(!snapshot.has_draft());
+        assert!(!paths.draft.exists());
+        assert!(!workspace_draft_path(&paths.workspace).exists());
     }
 
     #[test]
